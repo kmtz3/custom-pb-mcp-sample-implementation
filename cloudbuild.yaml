@@ -1,0 +1,27 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - build
+      - -t
+      - us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/productboard-mcp-server:$COMMIT_SHA
+      - .
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - push
+      - us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/productboard-mcp-server:$COMMIT_SHA
+
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - productboard-mcp-server
+      - --image=us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/productboard-mcp-server:$COMMIT_SHA
+      - --region=us-central1
+      - --allow-unauthenticated
+      - --service-account=pb-mcp-server@$PROJECT_ID.iam.gserviceaccount.com
+      - --project=$PROJECT_ID
+
+options:
+  logging: CLOUD_LOGGING_ONLY
