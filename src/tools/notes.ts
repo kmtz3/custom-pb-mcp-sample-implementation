@@ -11,11 +11,14 @@ function extractCursor(nextUrl: string | null): string | null {
   return m ? decodeURIComponent(m[1]) : null;
 }
 
-function handleError(err: unknown): string {
+function handleError(err: unknown, context?: 'note' | 'relationship'): string {
   if (err instanceof Error) {
     const pbErr = err as Error & { status?: number };
-    if (pbErr.status === 404) return 'Error: Note not found. Check the ID is correct.';
-    if (pbErr.status === 403) return 'Error: Permission denied. Your token may lack the required scope.';
+    if (pbErr.status === 404) {
+      if (context === 'relationship') return 'Error: Note or target entity not found. Check both IDs are correct. If the entity was just created, wait a few seconds and retry.';
+      return 'Error: Note not found. Check the ID is correct.';
+    }
+    if (pbErr.status === 403) return 'Error: Permission denied. Your token may lack the required scope (notes:write).';
     if (pbErr.status === 429) return 'Error: Rate limit exceeded. Please wait before retrying.';
     if (pbErr.status === 422) return `Error: Validation failed — ${pbErr.message}`;
     return `Error: ${pbErr.message}`;
@@ -236,7 +239,11 @@ Returns:
 
 Notes:
   - Tags must already exist in the workspace; unknown tags are rejected.
-  - Use pb_list_field_values (field_id="tags") to discover available tag names.`,
+  - Use pb_list_field_values (field_id="tags") to discover available tag names.
+  - Propagation delay: if customer_type/customer_id are provided and the customer entity
+    was just created (within the last ~30 seconds), the API may return 404. If this happens,
+    create the note without the customer fields, wait a few seconds, then use
+    pb_set_note_customer to link it.`,
       inputSchema: z.object({
         title: z.string().min(1).describe('Note title'),
         content: z.string().optional().describe('Note content/body'),
@@ -403,6 +410,13 @@ Returns:
 A note can be linked to one customer — either a Company (entity) or a User. This replaces
 any existing customer relationship.
 
+Uses POST /v2/notes/{id}/relationships (PBToolkit-verified pattern). If a customer
+relationship already exists it is automatically replaced by the API.
+
+Propagation delay: if the target company or user entity was just created (within the
+last ~30 seconds), this call may return a 404. Wait a few seconds and retry — the
+entity index catches up quickly.
+
 Args:
   - note_id (string): Note UUID
   - customer_type ('company' | 'user'): Type of customer to link
@@ -425,14 +439,14 @@ Returns:
     async ({ note_id, customer_type, customer_id }) => {
       try {
         await withRetry(
-          () => pbFetch<unknown>('PUT', `/v2/notes/${note_id}/relationships/customer`, {
-            data: { target: { type: customer_type, id: customer_id } },
+          () => pbFetch<unknown>('POST', `/v2/notes/${note_id}/relationships`, {
+            data: { type: 'customer', target: { type: customer_type, id: customer_id } },
           }),
           `set note customer ${note_id}`
         );
         return { content: [{ type: 'text', text: `Linked note \`${note_id}\` to ${customer_type} \`${customer_id}\`.` }] };
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return { content: [{ type: 'text', text: handleError(err, 'relationship') }] };
       }
     }
   );
@@ -632,7 +646,7 @@ Example:
         );
         return { content: [{ type: 'text', text: `Linked note \`${note_id}\` to entity \`${entity_id}\`.` }] };
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return { content: [{ type: 'text', text: handleError(err, 'relationship') }] };
       }
     }
   );
@@ -670,7 +684,7 @@ Returns:
         );
         return { content: [{ type: 'text', text: `Removed ${target_type} relationship \`${target_id}\` from note \`${note_id}\`.` }] };
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return { content: [{ type: 'text', text: handleError(err, 'relationship') }] };
       }
     }
   );
