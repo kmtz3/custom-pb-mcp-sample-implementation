@@ -227,6 +227,10 @@ Args:
   - content (string, optional): Note content/body as HTML (plain text is rejected; wrap in <p> tags,
     e.g. "<p>Customer requested dark mode.</p>")
   - owner_email (string, optional): Email of the PB workspace member who owns the note
+  - creator_email (string, optional): Email of the PB workspace member to set as the note creator.
+    Can only be set at creation time — cannot be changed after.
+  - archived (boolean, optional): Create the note in an archived state (default false)
+  - processed (boolean, optional): Create the note already marked as processed (default false)
   - tags (string[], optional): Tag names to apply (must already exist in workspace)
   - customer_type ('company' | 'user', optional): Link note to a customer
   - customer_id (string, optional): UUID of the company or user to link
@@ -248,6 +252,9 @@ Notes:
         title: z.string().min(1).describe('Note title'),
         content: z.string().optional().describe('Note content/body'),
         owner_email: z.string().email().optional().describe('Owner email (must be a workspace member)'),
+        creator_email: z.string().email().optional().describe('Creator email (must be a workspace member; can only be set at creation time)'),
+        archived: z.boolean().optional().describe('Create the note in an archived state'),
+        processed: z.boolean().optional().describe('Create the note already marked as processed'),
         tags: z.array(z.string()).optional().describe('Tag names to apply'),
         customer_type: z.enum(['company', 'user']).optional().describe('Customer relationship type'),
         customer_id: z.string().uuid().optional().describe('Customer company or user UUID'),
@@ -265,11 +272,14 @@ Notes:
         openWorldHint: true,
       },
     },
-    async ({ title, content, owner_email, tags, customer_type, customer_id, source_system, source_record_id, source_url }) => {
+    async ({ title, content, owner_email, creator_email, archived, processed, tags, customer_type, customer_id, source_system, source_record_id, source_url }) => {
       try {
         const fields: Record<string, unknown> = { name: title };
         if (content) fields['content'] = content;
         if (owner_email) fields['owner'] = { email: owner_email };
+        if (creator_email) fields['creator'] = { email: creator_email };
+        if (archived !== undefined) fields['archived'] = archived;
+        if (processed !== undefined) fields['processed'] = processed;
         if (tags?.length) fields['tags'] = tags.map((name) => ({ name }));
 
         const payload: Record<string, unknown> = {
