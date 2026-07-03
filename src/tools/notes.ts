@@ -261,10 +261,7 @@ Notes:
         source_system: z.string().optional().describe('Metadata source system'),
         source_record_id: z.string().optional().describe('Metadata source record ID'),
         source_url: z.string().url().optional().describe('Metadata source URL'),
-      }).strict().refine(
-        (d) => !(d.customer_type && !d.customer_id) && !(d.customer_id && !d.customer_type),
-        { message: 'customer_type and customer_id must both be provided together' }
-      ),
+      }).strict(),
       annotations: {
         readOnlyHint: false,
         destructiveHint: false,
@@ -274,6 +271,10 @@ Notes:
     },
     async ({ title, content, owner_email, creator_email, archived, processed, tags, customer_type, customer_id, source_system, source_record_id, source_url }) => {
       try {
+        if ((customer_type && !customer_id) || (customer_id && !customer_type)) {
+          return { content: [{ type: 'text', text: 'Error: customer_type and customer_id must both be provided together' }] };
+        }
+
         const fields: Record<string, unknown> = { name: title };
         if (content) fields['content'] = content;
         if (owner_email) fields['owner'] = { email: owner_email };
@@ -339,10 +340,7 @@ Returns:
         tags: z.array(z.string()).optional().describe('Replace tags (full list)'),
         archived: z.boolean().optional().describe('Archive or unarchive'),
         processed: z.boolean().optional().describe('Mark note as processed/reviewed'),
-      }).strict().refine(
-        (d) => [d.title, d.content, d.owner_email, d.tags, d.archived, d.processed].some((v) => v !== undefined),
-        { message: 'Provide at least one field to update' }
-      ),
+      }).strict(),
       annotations: {
         readOnlyHint: false,
         destructiveHint: false,
@@ -352,6 +350,10 @@ Returns:
     },
     async ({ id, title, content, owner_email, tags, archived, processed }) => {
       try {
+        if ([title, content, owner_email, tags, archived, processed].every((v) => v === undefined)) {
+          return { content: [{ type: 'text', text: 'Error: Provide at least one field to update' }] };
+        }
+
         const fields: Record<string, unknown> = {};
         if (title !== undefined) fields['name'] = title;
         if (content !== undefined) fields['content'] = content;

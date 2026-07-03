@@ -165,14 +165,15 @@ Returns:
         value_id: z.string().uuid().describe('Field value UUID to update'),
         name: z.string().optional().describe('New display name'),
         color: z.enum(['red', 'blue', 'green', 'yellow', 'purple', 'gray', 'lime', 'pink']).optional().describe('New color'),
-      }).strict().refine(
-        (d) => d.name !== undefined || d.color !== undefined,
-        { message: 'Provide at least one of name or color to update' }
-      ),
+      }).strict(),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     async ({ field_id, value_id, name, color }) => {
       try {
+        if (name === undefined && color === undefined) {
+          return { content: [{ type: 'text', text: 'Error: Provide at least one of name or color to update' }] };
+        }
+
         const fields: Record<string, unknown> = {};
         if (name !== undefined) fields['name'] = name;
         if (color !== undefined) fields['color'] = color;
@@ -216,14 +217,15 @@ Returns:
         value_id: z.string().uuid().describe('Field value UUID to delete'),
         force: z.boolean().optional().describe('Force-delete even if assigned to entities'),
         replace_with_id: z.string().uuid().optional().describe('Reassign current assignments to this value UUID before deleting'),
-      }).strict().refine(
-        (d) => !(d.force && d.replace_with_id),
-        { message: 'Cannot provide both force and replace_with_id' }
-      ),
+      }).strict(),
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
     async ({ field_id, value_id, force, replace_with_id }) => {
       try {
+        if (force && replace_with_id) {
+          return { content: [{ type: 'text', text: 'Error: Cannot provide both force and replace_with_id' }] };
+        }
+
         // Live API: DELETE body is rejected (400). force and replaceWith are query params.
         const params: string[] = [];
         if (force) params.push('force=true');

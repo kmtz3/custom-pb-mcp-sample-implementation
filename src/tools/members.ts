@@ -329,10 +329,7 @@ Note: Requires analytics scope. The analytics endpoint may not be available on a
         active_filter: z.enum(['all', 'active', 'inactive']).default('all').describe('Filter by activity state'),
         include_zero_activity: z.boolean().default(false).describe('Include members with zero activity (summary mode, requires workspace_members_only or enrich_profiles)'),
         response_format: responseFormatSchema,
-      }).strict().refine(
-        (d) => d.date_from <= d.date_to,
-        { message: 'date_from must not be after date_to' }
-      ),
+      }).strict(),
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -342,6 +339,10 @@ Note: Requires analytics scope. The analytics endpoint may not be available on a
     },
     async ({ date_from, date_to, mode, workspace_members_only, include_disabled, enrich_profiles, role_filter, active_filter, include_zero_activity, response_format }) => {
       try {
+        if (date_from > date_to) {
+          return { content: [{ type: 'text', text: 'Error: date_from must not be after date_to' }] };
+        }
+
         const VIEW_KEYS = [
           'gridBoardOpenedCount', 'timelineBoardOpenedCount', 'insightsBoardOpenedCount',
           'documentBoardOpenedCount', 'columnBoardOpenedCount',
@@ -777,14 +778,15 @@ Returns:
         // API enforces ^[a-z0-9]+$ — no hyphens, spaces, or uppercase
         handle: z.string().regex(/^[a-z0-9]+$/, 'Handle must be lowercase letters and digits only').optional().describe('New handle — lowercase letters and digits only, no hyphens'),
         description: z.string().optional().describe('New description'),
-      }).strict().refine(
-        (d) => [d.name, d.handle, d.description].some((v) => v !== undefined),
-        { message: 'Provide at least one field to update' }
-      ),
+      }).strict(),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     async ({ id, name, handle, description }) => {
       try {
+        if ([name, handle, description].every((v) => v === undefined)) {
+          return { content: [{ type: 'text', text: 'Error: Provide at least one field to update' }] };
+        }
+
         const fields: Record<string, unknown> = {};
         if (name !== undefined) fields['name'] = name;
         if (handle !== undefined) fields['handle'] = handle;

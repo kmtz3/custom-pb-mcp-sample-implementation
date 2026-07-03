@@ -478,10 +478,7 @@ Returns: The created entity with its assigned UUID.`,
         source_system: z.string().optional().describe('Metadata source system for dedup'),
         source_record_id: z.string().optional().describe('Metadata source record ID for dedup'),
         source_url: z.string().url().optional().describe('Metadata source URL'),
-      }).strict().refine(
-        (d) => !(ENTITY_TYPES_REQUIRING_PARENT as readonly string[]).includes(d.type) || !!d.parent_id,
-        (d) => ({ message: `parent_id is required when creating a ${d.type}`, path: ['parent_id'] })
-      ),
+      }).strict(),
       annotations: {
         readOnlyHint: false,
         destructiveHint: false,
@@ -491,6 +488,10 @@ Returns: The created entity with its assigned UUID.`,
     },
     async ({ type, name, parent_id, email, owner_email, status, teams, timeframe_start, timeframe_end, timeframe_granularity, health_status, health_comment, phase, fields, source_system, source_record_id, source_url }) => {
       try {
+        if ((ENTITY_TYPES_REQUIRING_PARENT as readonly string[]).includes(type) && !parent_id) {
+          return { content: [{ type: 'text', text: `Error: parent_id is required when creating a ${type}` }] };
+        }
+
         const entityType = type as string;
         const builtFields: Record<string, unknown> = { name, ...(fields ?? {}) };
 
@@ -590,10 +591,7 @@ Examples:
           path: z.string().describe('Field path, e.g. "name" or "tags"'),
           value: z.unknown().optional().describe('New value (required for set/addItems/removeItems)'),
         })).optional().describe('Granular patch operations (accepts array or JSON string)'),
-      }).strict().refine(
-        (d) => d.fields !== undefined || (d.patch !== undefined && d.patch.length > 0),
-        { message: 'Provide either fields or patch (at least one op)' }
-      ),
+      }).strict(),
       annotations: {
         readOnlyHint: false,
         destructiveHint: false,
@@ -603,6 +601,10 @@ Examples:
     },
     async ({ id, fields, patch }) => {
       try {
+        if (fields === undefined && (patch === undefined || patch.length === 0)) {
+          return { content: [{ type: 'text', text: 'Error: Provide either fields or patch (at least one op)' }] };
+        }
+
         const body: Record<string, unknown> = { data: {} };
         if (fields) (body['data'] as Record<string, unknown>)['fields'] = fields;
         if (patch) (body['data'] as Record<string, unknown>)['patch'] = patch;
