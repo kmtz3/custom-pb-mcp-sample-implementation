@@ -1,15 +1,15 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { pbFetch, withRetry, fetchPage } from '../services/pbClient.js';
+import { pbFetch, withRetry } from '../services/pbClient.js';
 import { CHARACTER_LIMIT } from '../constants.js';
-import { paginationSchema, responseFormatSchema, ResponseFormat } from '../schemas/common.js';
-import type { PBNote, PBNoteRelationship } from '../types.js';
-
-function extractCursor(nextUrl: string | null): string | null {
-  if (!nextUrl) return null;
-  const m = nextUrl.match(/pageCursor=([^&]+)/);
-  return m ? decodeURIComponent(m[1]) : null;
-}
+import { paginationSchema, responseFormatSchema, ResponseFormat, jsonArrayArg } from '../schemas/common.js';
+import type { PBNote } from '../types.js';
+import {
+  type Json, type Condition, type Query,
+  errorResult, respondList, respondObject, encodeCursor, scan, getPager, fetchAll,
+  noteRow, noteRowMd, relRow, entityNameResolver, simple, stripHtml, htmlToMarkdown, periodMs,
+  OPERATORS, conditionsArg, checkConditions, matches, fieldValue, matchedValues, noteFieldAlias,
+} from '../lib/shape.js';
 
 function handleError(err: unknown, context?: 'note' | 'relationship'): string {
   if (err instanceof Error) {
@@ -20,28 +20,35 @@ function handleError(err: unknown, context?: 'note' | 'relationship'): string {
     }
     if (pbErr.status === 403) return 'Error: Permission denied. Your token may lack the required scope (notes:write).';
     if (pbErr.status === 429) return 'Error: Rate limit exceeded. Please wait before retrying.';
-    if (pbErr.status === 422) return `Error: Validation failed — ${pbErr.message}`;
+    if (pbErr.status === 400 || pbErr.status === 422) return `Error: Validation failed — ${pbErr.message}`;
     return `Error: ${pbErr.message}`;
   }
   return `Error: ${String(err)}`;
 }
 
-function noteToMarkdown(n: PBNote): string {
-  const lines = [
-    `### ${n.fields.name ?? '(no title)'} \`${n.id}\``,
-    `- **Owner**: ${n.fields.owner?.email ?? 'unassigned'}`,
-  ];
-  if (n.fields.tags?.length) {
-    lines.push(`- **Tags**: ${n.fields.tags.map((t) => t.name).join(', ')}`);
-  }
-  if (n.fields.content) {
-    const preview = n.fields.content.slice(0, 300);
-    lines.push(`- **Content**: ${preview}${n.fields.content.length > 300 ? '…' : ''}`);
-  }
-  if (n.metadata?.source?.system) {
-    lines.push(`- **Source**: ${n.metadata.source.system} / ${n.metadata.source.recordId}`);
-  }
-  return lines.join('\n');
+const SCAN_BUDGET = Math.floor(CHARACTER_LIMIT * 0.7);
+
+/** Note field ids → display names (same for textNote / conversationNote / opportunityNote). */
+const NOTE_FIELDS: Record<string, string> = {
+  name: 'Title', content: 'Content', owner: 'Owner', creator: 'Creator', processed: 'Processed', archived: 'Archived', tags: 'Tags',
+};
+
+const noteListMarkdown = (title: string) => (o: Json) => [
+  `# ${title} (${o.count} results${o.has_more ? ', more available' : ''})`, '',
+  ...o.data.map(noteRowMd),
+  ...(o.truncated ? ['', `_${o.truncated}_`] : []),
+  ...(o.next_cursor ? ['', `_Next page cursor: \`${o.next_cursor}\`_`] : []),
+].join('\n');
+
+/** One page (up to `limit` rows) of GET /v2/notes with the given query; cursor-safe and size-safe. */
+async function listNotesPage(query: Query, limit: number, pageCursor: string | undefined, format: ResponseFormat, title: string) {
+  const res = await scan({ sources: [getPager('/v2/notes', query, 'list notes')], start: pageCursor, limit, maxPages: Math.ceil(limit / 100) + 1, map: noteRow });
+  return respondList({
+    format, rows: res.rows.map((r) => r.row),
+    cursorAt: (k) => encodeCursor(k < res.rows.length ? res.rows[k].pos : res.resume),
+    build: (shown, next, note) => ({ data: shown, count: shown.length, has_more: !!next, next_cursor: next ?? undefined, ...(note ? { truncated: note } : {}) }),
+    markdown: noteListMarkdown(title),
+  });
 }
 
 export function registerNoteTools(server: McpServer): void {
@@ -51,35 +58,33 @@ export function registerNoteTools(server: McpServer): void {
     'pb_list_notes',
     {
       title: 'List Productboard Notes',
-      description: `List Productboard notes (customer feedback) with optional filters and cursor pagination.
+      description: `List Productboard notes (customer feedback), newest first, with optional filters and cursor pagination.
+Returns compact rows with a 200-character preview; use pb_get_note for the full content.
+All filters are applied by Productboard (GET /v2/notes).
 
 Args:
-  - archived (boolean, optional): Include archived notes (default false)
+  - archived (boolean, optional): Filter by archived state
   - processed (boolean, optional): Filter by processed state
   - source_system (string, optional): Filter by metadata.source.system, e.g. "hubspot"
   - source_record_id (string, optional): Filter by metadata.source.recordId
-  - owner_id (string, optional): Filter by owner member UUID
-  - owner_email (string, optional): Filter by owner email (requires members:pii:read scope)
-  - creator_id (string, optional): Filter by creator member UUID
-  - creator_email (string, optional): Filter by creator email (requires members:pii:read scope)
-  - created_from (string, optional): ISO 8601 datetime — notes created on or after, e.g. "2024-01-01T00:00:00Z"
-  - created_to (string, optional): ISO 8601 datetime — notes created on or before, e.g. "2024-03-31T23:59:59Z"
-  - updated_from (string, optional): ISO 8601 datetime — notes updated on or after
-  - updated_to (string, optional): ISO 8601 datetime — notes updated on or before
-  - limit (number): Max results per page, 1–200 (default 50)
-  - page_cursor (string, optional): Cursor from a previous response's next_cursor field
+  - owner_id / owner_email (string, optional): Filter by owner (email requires members:pii:read scope)
+  - creator_id / creator_email (string, optional): Filter by creator
+  - created_from / created_to / updated_from / updated_to (string, optional): ISO 8601 datetimes
+  - limit (number): Max rows, 1–200 (default 50)
+  - page_cursor (string, optional): next_cursor from a previous response
   - response_format ('markdown' | 'json'): Output format (default 'markdown')
 
 Returns:
-  List of notes with title, owner, tags, content preview, and metadata.
-  JSON: { data: PBNote[], count, has_more, next_cursor }
+  { data: [{ id, type, title, preview, owner, creator, tags, processed, archived, createdAt, updatedAt, url }], count, has_more, next_cursor }
 
 Examples:
   - "Show HubSpot deal notes" → source_system="hubspot"
   - "Unprocessed notes" → processed=false
-  - "Show feedback from Q1 2024" → created_from="2024-01-01T00:00:00Z", created_to="2024-03-31T23:59:59Z"`,
+  - "Feedback from Q1 2024" → created_from="2024-01-01T00:00:00Z", created_to="2024-03-31T23:59:59Z"
+
+For text search, relative dates, or notes linked to a feature/customer use pb_search_notes or pb_list_entity_feedback.`,
       inputSchema: z.object({
-        archived: z.boolean().optional().describe('Include archived notes'),
+        archived: z.boolean().optional().describe('Filter by archived state'),
         processed: z.boolean().optional().describe('Filter by processed state'),
         source_system: z.string().optional().describe('Filter by metadata.source.system'),
         source_record_id: z.string().optional().describe('Filter by metadata.source.recordId'),
@@ -101,47 +106,51 @@ Examples:
         openWorldHint: true,
       },
     },
-    async ({ archived, processed, source_system, source_record_id, owner_id, owner_email, creator_id, creator_email, created_from, created_to, updated_from, updated_to, limit, page_cursor, response_format }) => {
+    async (a) => {
       try {
-        const params: string[] = [];
-        if (archived !== undefined) params.push(`archived=${archived}`);
-        if (processed !== undefined) params.push(`processed=${processed}`);
-        if (source_system) params.push(`metadata[source][system]=${encodeURIComponent(source_system)}`);
-        if (source_record_id) params.push(`metadata[source][recordId]=${encodeURIComponent(source_record_id)}`);
-        if (owner_id) params.push(`owner[id]=${encodeURIComponent(owner_id)}`);
-        if (owner_email) params.push(`owner[email]=${encodeURIComponent(owner_email)}`);
-        if (creator_id) params.push(`creator[id]=${encodeURIComponent(creator_id)}`);
-        if (creator_email) params.push(`creator[email]=${encodeURIComponent(creator_email)}`);
-        if (created_from) params.push(`createdFrom=${encodeURIComponent(created_from)}`);
-        if (created_to) params.push(`createdTo=${encodeURIComponent(created_to)}`);
-        if (updated_from) params.push(`updatedFrom=${encodeURIComponent(updated_from)}`);
-        if (updated_to) params.push(`updatedTo=${encodeURIComponent(updated_to)}`);
-
-        if (page_cursor) params.unshift(`pageCursor=${encodeURIComponent(page_cursor)}`);
-        const path = `/v2/notes${params.length ? `?${params.join('&')}` : ''}`;
-
-        const { data: rawData, nextUrl } = await fetchPage<PBNote>(path, 'list notes');
-        const data = rawData.slice(0, limit);
-        const nextCursor = extractCursor(nextUrl);
-        const output = { data, count: data.length, has_more: !!nextCursor, next_cursor: nextCursor ?? undefined };
-
-        let text: string;
-        if (response_format === ResponseFormat.MARKDOWN) {
-          const lines = [`# Notes (${data.length} results${nextCursor ? ', more available' : ''})`, ''];
-          for (const n of data) lines.push(noteToMarkdown(n), '');
-          if (nextCursor) lines.push(`---\n_Next page cursor: \`${nextCursor}\`_`);
-          text = lines.join('\n');
-        } else {
-          text = JSON.stringify(output, null, 2);
-        }
-
-        if (text.length > CHARACTER_LIMIT) {
-          text = text.slice(0, CHARACTER_LIMIT) + '\n\n... [truncated]';
-        }
-
-        return { content: [{ type: 'text', text }], structuredContent: output as unknown as Record<string, unknown> };
+        return await listNotesPage({
+          archived: a.archived, processed: a.processed,
+          'metadata[source][system]': a.source_system, 'metadata[source][recordId]': a.source_record_id,
+          'owner[id]': a.owner_id, 'owner[email]': a.owner_email, 'creator[id]': a.creator_id, 'creator[email]': a.creator_email,
+          createdFrom: a.created_from, createdTo: a.created_to, updatedFrom: a.updated_from, updatedTo: a.updated_to,
+        }, a.limit, a.page_cursor, a.response_format, 'Notes');
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
+      }
+    }
+  );
+
+  // ── pb_list_entity_feedback ───────────────────────────────────────────────
+  server.registerTool(
+    'pb_list_entity_feedback',
+    {
+      title: 'List Feedback Linked to an Entity',
+      description: `List the feedback notes linked to a feature (or other entity such as a subfeature, component,
+product or initiative) — the customer evidence behind it. Uses GET /v2/notes?relationships[link][ids][]=<id>.
+
+Args:
+  - id (string): Feature / entity UUID
+  - processed (boolean, optional), archived (boolean, optional): Extra filters
+  - limit (number): Max rows, 1–200 (default 50)
+  - page_cursor (string, optional): next_cursor from a previous response
+  - response_format ('markdown' | 'json'): Output format (default 'markdown')
+
+Returns:
+  Compact note rows (use pb_get_note for full text): { data, count, has_more, next_cursor }`,
+      inputSchema: z.object({
+        id: z.string().uuid().describe('Feature or entity UUID'),
+        processed: z.boolean().optional().describe('Filter by processed state'),
+        archived: z.boolean().optional().describe('Filter by archived state'),
+        ...paginationSchema,
+        response_format: responseFormatSchema,
+      }).strict(),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ id, processed, archived, limit, page_cursor, response_format }) => {
+      try {
+        return await listNotesPage({ 'relationships[link][ids][]': [id], processed, archived }, limit, page_cursor, response_format, `Feedback linked to ${id}`);
+      } catch (err) {
+        return errorResult(handleError(err));
       }
     }
   );
@@ -151,18 +160,21 @@ Examples:
     'pb_get_note',
     {
       title: 'Get Productboard Note',
-      description: `Get a single Productboard note by UUID, including its relationships (linked features/products/customers).
+      description: `Get a single Productboard note by UUID: full content (HTML converted to markdown), fields, source,
+and its relationships (customer user/company and linked features/entities, each with its name).
 
 Args:
   - id (string): Note UUID
   - include_relationships (boolean): Also fetch the note's relationships (default true)
+  - raw (boolean): Return the unmodified API response instead (default false)
   - response_format ('markdown' | 'json'): Output format (default 'markdown')
 
 Returns:
-  The note fields, metadata, and (if include_relationships=true) any linked entities/customers.`,
+  { id, type, title, content, owner, creator, tags, processed, archived, createdAt, updatedAt, url, source, relationships }`,
       inputSchema: z.object({
         id: z.string().uuid().describe('Note UUID'),
         include_relationships: z.boolean().default(true).describe('Fetch note relationships'),
+        raw: z.boolean().default(false).describe('Return the unmodified API response'),
         response_format: responseFormatSchema,
       }).strict(),
       annotations: {
@@ -172,42 +184,48 @@ Returns:
         openWorldHint: true,
       },
     },
-    async ({ id, include_relationships, response_format }) => {
+    async ({ id, include_relationships, raw, response_format }) => {
       try {
-        const [noteRes, relsData] = await Promise.all([
-          withRetry(() => pbFetch<{ data: PBNote }>('GET', `/v2/notes/${id}`), `get note ${id}`),
+        const [noteRes, rels] = await Promise.all([
+          withRetry(() => pbFetch<{ data: PBNote & Json }>('GET', `/v2/notes/${id}`), `get note ${id}`),
           include_relationships
-            ? withRetry(
-                () => pbFetch<{ data: PBNoteRelationship[] }>('GET', `/v2/notes/${id}/relationships`),
-                `get note relationships ${id}`
-              ).then((r) => r.data ?? [])
-            : Promise.resolve([]),
+            ? fetchAll(getPager(`/v2/notes/${id}/relationships`, {}, `get note relationships ${id}`))
+            : Promise.resolve([] as Json[]),
         ]);
-
-        const note = noteRes.data;
-        const output = { ...note, relationships: relsData };
-
-        let text: string;
-        if (response_format === ResponseFormat.MARKDOWN) {
+        if (raw) return respondObject(response_format, { ...noteRes, relationships: rels }, (o) => '```json\n' + JSON.stringify(o, null, 1) + '\n```');
+        const n = noteRes.data;
+        const named = include_relationships ? await entityNameResolver()(rels.map(relRow)) : null;
+        const { name, content, owner, creator, tags, processed, archived, ...rest } = (n.fields ?? {}) as Json;
+        const out = {
+          id: n.id, type: n.type, title: name,
+          content: typeof content === 'string' ? htmlToMarkdown(content) : simple(content),
+          owner: simple(owner) ?? undefined, creator: simple(creator) ?? undefined,
+          tags: Array.isArray(tags) && tags.length ? simple(tags) : undefined,
+          processed, archived, createdAt: n.createdAt, updatedAt: n.updatedAt, url: n.links?.html,
+          source: n.metadata?.source,
+          ...(Object.keys(rest).length ? { other_fields: Object.fromEntries(Object.entries(rest).map(([k, v]) => [k, simple(v)])) } : {}),
+          ...(named ? { relationships: named.items, ...(named.names_truncated ? { names_truncated: named.names_truncated } : {}) } : {}),
+        };
+        return respondObject(response_format, out, (o) => {
           const lines = [
-            `# Note: ${note.fields.name ?? id}`,
-            '',
-            noteToMarkdown(note),
+            `# Note: ${o.title ?? '(no title)'} \`${o.id}\``,
+            `- **Type**: ${o.type}`,
+            `- **Owner**: ${o.owner ?? 'unassigned'}${o.creator ? ` | **Creator**: ${o.creator}` : ''}`,
+            `- **Processed**: ${o.processed ? 'yes' : 'no'}${o.archived ? ' | **Archived**' : ''}`,
+            `- **Created**: ${o.createdAt ?? 'n/a'} | **Updated**: ${o.updatedAt ?? 'n/a'}`,
           ];
-          if (relsData.length > 0) {
+          if (o.tags?.length) lines.push(`- **Tags**: ${o.tags.join(', ')}`);
+          if (o.source?.system) lines.push(`- **Source**: ${o.source.system} / ${o.source.recordId}${o.source.url ? ` (${o.source.url})` : ''}`);
+          if (o.url) lines.push(`- **URL**: ${o.url}`);
+          if (o.relationships?.length) {
             lines.push('', '**Relationships:**');
-            for (const r of relsData) {
-              lines.push(`- ${r.type}: \`${r.target.id}\` (${r.target.type})`);
-            }
+            for (const r of o.relationships) lines.push(`- ${r.type}: **${r.target_name ?? '?'}** \`${r.target_id}\` (${r.target_type})`);
           }
-          text = lines.join('\n');
-        } else {
-          text = JSON.stringify(output, null, 2);
-        }
-
-        return { content: [{ type: 'text', text }], structuredContent: output as unknown as Record<string, unknown> };
+          lines.push('', '## Content', '', typeof o.content === 'string' ? o.content : JSON.stringify(o.content ?? ''));
+          return lines.join('\n');
+        });
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );
@@ -272,7 +290,7 @@ Notes:
     async ({ title, content, owner_email, creator_email, archived, processed, tags, customer_type, customer_id, source_system, source_record_id, source_url }) => {
       try {
         if ((customer_type && !customer_id) || (customer_id && !customer_type)) {
-          return { content: [{ type: 'text', text: 'Error: customer_type and customer_id must both be provided together' }] };
+          return errorResult('Error: customer_type and customer_id must both be provided together');
         }
 
         const fields: Record<string, unknown> = { name: title };
@@ -306,7 +324,7 @@ Notes:
         const text = `Created note \`${note.id}\`: **${note.fields?.name ?? title}**`;
         return { content: [{ type: 'text', text }], structuredContent: note as unknown as Record<string, unknown> };
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );
@@ -351,7 +369,7 @@ Returns:
     async ({ id, title, content, owner_email, tags, archived, processed }) => {
       try {
         if ([title, content, owner_email, tags, archived, processed].every((v) => v === undefined)) {
-          return { content: [{ type: 'text', text: 'Error: Provide at least one field to update' }] };
+          return errorResult('Error: Provide at least one field to update');
         }
 
         const fields: Record<string, unknown> = {};
@@ -369,7 +387,7 @@ Returns:
 
         return { content: [{ type: 'text', text: `Updated note \`${id}\` successfully.` }] };
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );
@@ -407,7 +425,7 @@ Returns:
         );
         return { content: [{ type: 'text', text: `Deleted note \`${id}\`.` }] };
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );
@@ -458,62 +476,74 @@ Returns:
         );
         return { content: [{ type: 'text', text: `Linked note \`${note_id}\` to ${customer_type} \`${customer_id}\`.` }] };
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err, 'relationship') }] };
+        return errorResult(handleError(err, 'relationship'));
       }
     }
   );
+
 
   // ── pb_search_notes ───────────────────────────────────────────────────────
   server.registerTool(
     'pb_search_notes',
     {
       title: 'Search Productboard Notes',
-      description: `Search Productboard notes with hybrid GET + POST routing for correct filtering.
+      description: `Search Productboard notes (customer feedback).
 
-Routing (live-verified — POST search silently ignores most filter fields):
-  - No relationship filters → GET /v2/notes (archived, processed, owner, source all server-side)
-  - With relationship filters (customer_ids / link_ids) → POST /v2/notes/search
-    (server-side: relationships + source; client-side pass: archived, owner, processed)
-  - tags and name are always applied client-side regardless of path
-
-Filter logic:
-  - customer_ids / link_ids: OR within each, AND between types
-  - tags: ALL must be present (AND logic)
+Server-side (GET /v2/notes — POST /v2/notes/search is not used because it rejects its published
+filter shape and silently ignores unknown filter keys): archived, processed, owner, source,
+created/updated date bounds, linked entities and customers.
+Client-side, on each fetched page: text, name, tags and operator conditions.
 
 Args:
-  - name (string, optional): Client-side partial title match
-  - archived (boolean, optional): Filter by archived status
-  - processed (boolean, optional): Filter by processed state
-  - owner_email (string, optional): Filter by owner email (requires members:pii:read scope)
-  - tags (string[], optional): Notes must have ALL of these tag names (client-side)
-  - customer_ids (string[], optional): Linked customer/company UUIDs (OR logic)
-  - link_ids (string[], optional): Linked hierarchy entity UUIDs e.g. feature IDs (OR logic)
-  - source_system (string, optional): Filter by metadata.source.system
-  - source_record_id (string, optional): Filter by metadata.source.recordId
-  - limit (number): Max results per page, 1–200 (default 50)
-  - page_cursor (string, optional): Cursor from a previous response's next_cursor field
+  - text (string, optional): Case-insensitive match in the title or content (HTML stripped)
+  - name (string, optional): Case-insensitive match in the title only
+  - created_in_last / updated_in_last (string, optional): Period such as "7 days", "2 weeks", "3 months"
+  - created_from / created_to / updated_from / updated_to (string, optional): ISO 8601 bounds
+  - linked_entity_ids (string[], optional): Notes linked to any of these features/entities (OR). Alias: link_ids
+  - customer_ids (string[], optional): Notes whose customer is any of these users/companies (OR)
+  - archived / processed (boolean, optional)
+  - owner_email / owner_id (string, optional): Note owner
+  - tags (string[], optional): Notes must have ALL of these tag names
+  - source_system / source_record_id (string, optional): metadata.source filters
+  - conditions (array, optional): [{ field, operator, value }] on note fields (title, content, owner,
+    creator, processed, archived, tags, createdAt, updatedAt). Operators: ${OPERATORS.join(', ')}
+  - limit (number): Stop after this many matches (default 50, max 200)
+  - max_pages (number): Max API pages (100 notes each) to scan per call (default 10, max 40)
+  - page_cursor (string, optional): resume_cursor from a previous call
   - response_format ('markdown' | 'json'): Output format (default 'markdown')
 
 Returns:
-  JSON: { data: PBNote[], count, has_more, next_cursor, _route }
+  { data: compact note rows, count, scanned, pages_scanned, complete, resume_cursor, filters_sent }
+  If complete=false, pass resume_cursor as page_cursor to keep scanning (nothing is skipped or repeated).
 
 Examples:
-  - "Find notes mentioning pricing" → name="pricing"
-  - "Salesforce notes" → source_system="salesforce"
-  - "Notes linked to company X" → customer_ids=["<uuid>"]
-  - "Unprocessed notes for feature Y" → link_ids=["<uuid>"], processed=false
-  - "Notes tagged 'churn'" → tags=["churn"]`,
+  - "Feedback mentioning pricing in the last month" → text="pricing", created_in_last="30 days"
+  - "Notes for feature X" → linked_entity_ids=["<feature-uuid>"]  (or use pb_list_entity_feedback)
+  - "Notes from company Y" → customer_ids=["<company-uuid>"]
+  - "Unprocessed notes tagged churn" → processed=false, tags=["churn"]`,
       inputSchema: z.object({
-        name: z.string().optional().describe('Client-side partial title match'),
-        archived: z.boolean().optional().describe('Filter by archived status'),
+        text: z.string().min(1).optional().describe('Match in title or content (case-insensitive)'),
+        name: z.string().min(1).optional().describe('Match in title only (case-insensitive)'),
+        created_in_last: z.string().optional().describe('Period, e.g. "7 days", "2 weeks", "3 months"'),
+        updated_in_last: z.string().optional().describe('Period, e.g. "7 days"'),
+        created_from: z.string().optional().describe('ISO 8601 — created on or after'),
+        created_to: z.string().optional().describe('ISO 8601 — created on or before'),
+        updated_from: z.string().optional().describe('ISO 8601 — updated on or after'),
+        updated_to: z.string().optional().describe('ISO 8601 — updated on or before'),
+        linked_entity_ids: jsonArrayArg(z.string().uuid()).optional().describe('Notes linked to any of these entity UUIDs (OR)'),
+        link_ids: jsonArrayArg(z.string().uuid()).optional().describe('Alias of linked_entity_ids'),
+        customer_ids: jsonArrayArg(z.string().uuid()).optional().describe('Notes whose customer is any of these user/company UUIDs (OR)'),
+        archived: z.boolean().optional().describe('Filter by archived state'),
         processed: z.boolean().optional().describe('Filter by processed state'),
         owner_email: z.string().email().optional().describe('Filter by owner email (requires members:pii:read scope)'),
-        tags: z.array(z.string()).optional().describe('Notes must have ALL of these tag names (client-side)'),
-        customer_ids: z.array(z.string().uuid()).optional().describe('Linked customer/company UUIDs (OR logic)'),
-        link_ids: z.array(z.string().uuid()).optional().describe('Linked hierarchy entity UUIDs e.g. feature IDs (OR logic)'),
+        owner_id: z.string().uuid().optional().describe('Filter by owner member UUID'),
+        tags: jsonArrayArg(z.string()).optional().describe('Notes must have ALL of these tag names'),
         source_system: z.string().optional().describe('metadata.source.system filter'),
         source_record_id: z.string().optional().describe('metadata.source.recordId filter'),
-        ...paginationSchema,
+        conditions: conditionsArg.optional(),
+        limit: z.number().int().min(1).max(200).default(50).describe('Stop after this many matches (1–200, default 50)'),
+        max_pages: z.number().int().min(1).max(40).default(10).describe('Max API pages to scan per call (default 10)'),
+        page_cursor: z.string().optional().describe('resume_cursor from a previous call'),
         response_format: responseFormatSchema,
       }).strict(),
       annotations: {
@@ -523,94 +553,70 @@ Examples:
         openWorldHint: true,
       },
     },
-    async ({ name, archived, processed, owner_email, tags, customer_ids, link_ids, source_system, source_record_id, limit, page_cursor, response_format }) => {
+    async (a) => {
       try {
-        const hasRelFilter = !!(customer_ids?.length || link_ids?.length);
-        let allData: PBNote[] = [];
-        let nextCursor: string | null = null;
-        let route: 'GET' | 'POST';
+        const conds: Condition[] = (a.conditions ?? []).map(noteFieldAlias);
+        checkConditions(conds);
+        const known = new Set(['createdat', 'updatedat', ...Object.keys(NOTE_FIELDS), ...Object.values(NOTE_FIELDS).map((n) => n.toLowerCase())]);
+        const unknown = conds.map((c) => c.field).filter((f) => !known.has(f.split('.')[0].toLowerCase()));
+        if (unknown.length) {
+          return errorResult(`Error: Unknown note field(s): ${unknown.join(', ')}. Note fields: title, content, owner, creator, processed, archived, tags, createdAt, updatedAt.`);
+        }
 
-        if (hasRelFilter) {
-          // POST path: server-side for relationships + source metadata.
-          // archived / owner_email / processed are silently ignored by POST — apply client-side after.
-          route = 'POST';
-          const filter: Record<string, unknown> = {};
-          if (source_system || source_record_id) {
-            filter['metadata'] = { source: {
-              ...(source_system ? { system: source_system } : {}),
-              ...(source_record_id ? { recordId: source_record_id } : {}),
-            }};
+        // "in the last N days" is fixed once per call, so a resumed scan uses a fresh window.
+        const since = (p?: string) => (p ? new Date(Date.now() - periodMs(p)).toISOString() : undefined);
+        const linked = [...new Set([...(a.linked_entity_ids ?? []), ...(a.link_ids ?? [])])];
+        const query: Query = {
+          archived: a.archived, processed: a.processed,
+          'owner[email]': a.owner_email, 'owner[id]': a.owner_id,
+          'metadata[source][system]': a.source_system, 'metadata[source][recordId]': a.source_record_id,
+          createdFrom: since(a.created_in_last) ?? a.created_from, createdTo: a.created_to,
+          updatedFrom: since(a.updated_in_last) ?? a.updated_from, updatedTo: a.updated_to,
+          'relationships[link][ids][]': linked.length ? linked : undefined,
+          'relationships[customer][ids][]': a.customer_ids?.length ? a.customer_ids : undefined,
+        };
+
+        const text = a.text?.toLowerCase();
+        const name = a.name?.toLowerCase();
+        const now = Date.now();
+        const test = (n: Json): boolean => {
+          const title = String(n.fields?.name ?? '');
+          if (name && !title.toLowerCase().includes(name)) return false;
+          if (text) {
+            const c = n.fields?.content;
+            const body = typeof c === 'string' ? stripHtml(c) : JSON.stringify(c ?? '');
+            if (!`${title}\n${body}`.toLowerCase().includes(text)) return false;
           }
-          // PB notes/search expects relationships as arrays of {id} objects, not {ids:[]}
-          // Confirmed from PBToolkit/src/routes/companiesDuplicateCleanup.js (source of truth).
-          const relationships: Record<string, unknown> = {};
-          if (customer_ids?.length) relationships['customer'] = customer_ids.map((id) => ({ id }));
-          if (link_ids?.length) relationships['link'] = link_ids.map((id) => ({ id }));
-          filter['relationships'] = relationships;
-
-          const url = page_cursor
-            ? `/v2/notes/search?pageCursor=${encodeURIComponent(page_cursor)}`
-            : '/v2/notes/search';
-
-          const raw = await withRetry(
-            () => pbFetch<{ data: PBNote[]; links?: { next?: string } }>('POST', url, { data: { filter } }),
-            'search notes (POST)'
-          );
-          allData = raw.data ?? [];
-          nextCursor = extractCursor(raw.links?.next ?? null);
-
-          // Client-side pass for what POST search silently ignores (live-verified May 2026)
-          if (archived !== undefined) allData = allData.filter((n) => !!n.fields.archived === archived);
-          if (owner_email) allData = allData.filter((n) => n.fields.owner?.email === owner_email);
-          if (processed !== undefined) {
-            allData = allData.filter((n) => !!(n.fields as Record<string, unknown>)['processed'] === processed);
+          if (a.tags?.length) {
+            const have = new Set(((n.fields?.tags ?? []) as Json[]).map((t) => String(t?.name ?? '').toLowerCase()));
+            if (!a.tags.every((t) => have.has(t.toLowerCase()))) return false;
           }
-        } else {
-          // GET path: archived, processed, owner, source all handled server-side
-          route = 'GET';
-          const params: string[] = [];
-          if (archived !== undefined) params.push(`archived=${archived}`);
-          if (processed !== undefined) params.push(`processed=${processed}`);
-          if (owner_email) params.push(`owner[email]=${encodeURIComponent(owner_email)}`);
-          if (source_system) params.push(`metadata[source][system]=${encodeURIComponent(source_system)}`);
-          if (source_record_id) params.push(`metadata[source][recordId]=${encodeURIComponent(source_record_id)}`);
-          if (page_cursor) params.unshift(`pageCursor=${encodeURIComponent(page_cursor)}`);
-          const path = `/v2/notes${params.length ? `?${params.join('&')}` : ''}`;
+          return conds.every((c) => matches(fieldValue(n, c.field, NOTE_FIELDS), c.operator, c.value, now));
+        };
 
-          const { data: rawData, nextUrl } = await fetchPage<PBNote>(path, 'search notes (GET)');
-          allData = rawData;
-          nextCursor = extractCursor(nextUrl);
-        }
+        const res = await scan({
+          sources: [getPager('/v2/notes', query, 'search notes')], start: a.page_cursor,
+          limit: a.limit, maxPages: a.max_pages, budget: SCAN_BUDGET, test,
+          map: (n: Json) => ({ ...noteRow(n), matched: matchedValues(n, conds, NOTE_FIELDS) }),
+        });
+        const filtersSent = Object.fromEntries(Object.entries(query).filter(([, v]) => v !== undefined));
 
-        // Client-side filters that neither endpoint handles natively
-        if (tags?.length) {
-          allData = allData.filter((n) =>
-            tags.every((t) => (n.fields.tags ?? []).some((nt) => nt.name === t))
-          );
-        }
-        if (name) {
-          const lc = name.toLowerCase();
-          allData = allData.filter((n) => (n.fields.name ?? '').toLowerCase().includes(lc));
-        }
-
-        const data = allData.slice(0, limit);
-        const output = { data, count: data.length, has_more: !!nextCursor, next_cursor: nextCursor ?? undefined, _route: route };
-
-        let text: string;
-        if (response_format === ResponseFormat.MARKDOWN) {
-          const lines = [`# Notes Search (${data.length} results${nextCursor ? ', more available' : ''})`, ''];
-          for (const n of data) lines.push(noteToMarkdown(n), '');
-          if (nextCursor) lines.push(`---\n_Next page cursor: \`${nextCursor}\`_`);
-          text = lines.join('\n');
-        } else {
-          text = JSON.stringify(output, null, 2);
-        }
-
-        if (text.length > CHARACTER_LIMIT) text = text.slice(0, CHARACTER_LIMIT) + '\n\n... [truncated]';
-
-        return { content: [{ type: 'text', text }], structuredContent: output as unknown as Record<string, unknown> };
+        return respondList({
+          format: a.response_format, rows: res.rows.map((r) => r.row),
+          cursorAt: (k) => encodeCursor(k < res.rows.length ? res.rows[k].pos : res.resume),
+          build: (shown, next, note) => ({
+            data: shown, count: shown.length, scanned: res.scanned, pages_scanned: res.pagesScanned,
+            complete: !next, resume_cursor: next, filters_sent: filtersSent, ...(note ? { truncated: note } : {}),
+          }),
+          markdown: (o) => [
+            `# Notes Search (${o.count} matches, ${o.scanned} scanned${o.complete ? ', complete' : ', more to scan'})`, '',
+            ...o.data.map(noteRowMd),
+            ...(o.truncated ? ['', `_${o.truncated}_`] : []),
+            ...(o.resume_cursor ? ['', `_Scan not complete — continue with page_cursor: \`${o.resume_cursor}\`_`] : []),
+          ].join('\n'),
+        });
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );
@@ -658,7 +664,7 @@ Example:
         );
         return { content: [{ type: 'text', text: `Linked note \`${note_id}\` to entity \`${entity_id}\`.` }] };
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err, 'relationship') }] };
+        return errorResult(handleError(err, 'relationship'));
       }
     }
   );
@@ -696,7 +702,7 @@ Returns:
         );
         return { content: [{ type: 'text', text: `Removed ${target_type} relationship \`${target_id}\` from note \`${note_id}\`.` }] };
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err, 'relationship') }] };
+        return errorResult(handleError(err, 'relationship'));
       }
     }
   );

@@ -1,6 +1,6 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { pbFetch, withRetry, fetchPage, fetchAllPages } from '../services/pbClient.js';
+import { pbFetch, withRetry } from '../services/pbClient.js';
 import {
   CHARACTER_LIMIT,
   ENTITY_TYPES,
@@ -8,16 +8,15 @@ import {
   HAS_TIMEFRAME,
   HEALTH_TYPES,
   HAS_PHASE,
-  ENTITY_CASCADE_ANCESTORS,
 } from '../constants.js';
 import { paginationSchema, responseFormatSchema, ResponseFormat, jsonObjectArg, jsonArrayArg } from '../schemas/common.js';
-import type { PBEntity, PBEntityConfiguration, PBPage, PBNoteRelationship } from '../types.js';
-
-function extractCursor(nextUrl: string | null): string | null {
-  if (!nextUrl) return null;
-  const m = nextUrl.match(/pageCursor=([^&]+)/);
-  return m ? decodeURIComponent(m[1]) : null;
-}
+import type { PBEntity, PBEntityConfiguration } from '../types.js';
+import {
+  type Json, type Condition, type PageFetcher,
+  errorResult, respondList, respondObject, encodeCursor, scan, getPager, postPager, fetchAll,
+  entityRow, entityRowMd, relRow, flipDependency, entityNameResolver, namedFields, fieldNameResolver, resolveFieldKey, htmlToMarkdown, isHtml,
+  OPERATORS, conditionsArg, checkConditions, matches, fieldValue, matchedValues,
+} from '../lib/shape.js';
 
 function handleError(err: unknown): string {
   if (err instanceof Error) {
@@ -25,30 +24,23 @@ function handleError(err: unknown): string {
     if (pbErr.status === 404) return 'Error: Entity not found. Check the ID is correct.';
     if (pbErr.status === 403) return 'Error: Permission denied. Your token may lack the required scope.';
     if (pbErr.status === 429) return 'Error: Rate limit exceeded. Please wait before retrying.';
-    if (pbErr.status === 422) return `Error: Validation failed — ${pbErr.message}`;
+    if (pbErr.status === 400 || pbErr.status === 422) return `Error: Validation failed — ${pbErr.message}`;
     return `Error: ${pbErr.message}`;
   }
   return `Error: ${String(err)}`;
 }
 
-function entityToMarkdown(e: PBEntity): string {
-  const lines: string[] = [
-    `### ${(e.fields['name'] as string) ?? e.id} \`${e.id}\``,
-    `- **Type**: ${e.type}`,
-  ];
-  if (e.createdAt) lines.push(`- **Created**: ${e.createdAt}`);
-  if (e.updatedAt) lines.push(`- **Updated**: ${e.updatedAt}`);
-  for (const [k, v] of Object.entries(e.fields)) {
-    if (k === 'name' || v === null || v === undefined) continue;
-    const display = typeof v === 'object' ? JSON.stringify(v) : String(v);
-    lines.push(`- **${k}**: ${display}`);
-  }
-  if (e.metadata?.source?.system) {
-    lines.push(`- **Source**: ${e.metadata.source.system} / ${e.metadata.source.recordId}`);
-  }
-  if (e.links?.html) lines.push(`- **URL**: ${e.links.html}`);
-  return lines.join('\n');
-}
+const SCAN_BUDGET = Math.floor(CHARACTER_LIMIT * 0.7);
+
+/** All relationship pages, with UI-direction types and related entity names. `type` is in UI terms. */
+const relationshipRows = async (id: string, type?: string) => {
+  const rows = (await fetchAll(getPager(`/v2/entities/${id}/relationships`, { type: flipDependency(type) }, `relationships ${id}`))).map(relRow);
+  return entityNameResolver()(rows);
+};
+
+/** Inline relationships on an entity are capped (≈10, with links.next); use the endpoint for the full list. */
+const parentIdOf = (e: Json): string | undefined =>
+  (e.relationships?.data ?? []).find((r: Json) => r.type === 'parent')?.target?.id;
 
 export function registerEntityTools(server: McpServer): void {
 
@@ -57,37 +49,42 @@ export function registerEntityTools(server: McpServer): void {
     'pb_list_entities',
     {
       title: 'List Productboard Entities',
-      description: `List Productboard entities with cursor pagination.
+      description: `List Productboard entities of one type with cursor pagination. Returns compact rows
+(id, name, type, status, owner email, teams, archived, url); use pb_get_entity for all fields.
 
 Supported types: product, component, feature, subfeature, initiative, objective, keyResult, release, releaseGroup, company, user
 
 Args:
   - type (string): Entity type
-  - parent_id (string, optional): Filter to direct children of this entity UUID.
-    Useful for navigating the hierarchy (e.g. list features under a component).
-  - fields (string[], optional): Field projection — return only these fields.
-    Pass ["all"] to include fields with null values. Pass ["name","status"] to return
-    only those fields. Omit to return all non-null fields (default).
-    Reduces response size significantly for entities with many custom fields.
-  - limit (number): Max results per page, 1–200 (default 50)
-  - page_cursor (string, optional): Cursor from a previous response's next_cursor field
+  - parent_id (string, optional): Only direct children of this entity UUID
+  - name (string, optional): Only entities whose name contains this text (server-side)
+  - status_name (string, optional): Exact status name, e.g. "In progress" (server-side)
+  - owner_email (string, optional): Owner email (server-side)
+  - archived (boolean, optional): true = only archived, false = only non-archived. Omit for both.
+  - fields (string[], optional): Extra fields to include in each row, by display name or id
+    (e.g. ["Effort", "Timeframe"]). Pass ["all"] to include every field (large).
+  - limit (number): Max rows to return, 1–200 (default 50)
+  - page_cursor (string, optional): next_cursor from a previous response
   - response_format ('markdown' | 'json'): Output format (default 'markdown')
 
 Returns:
-  A list of entities with their fields, plus next_cursor if more pages exist.
+  { data: rows[], count, has_more, next_cursor }. Nothing is skipped between pages: when fewer
+  rows are returned than the API page holds, next_cursor resumes at the next row.
 
 Examples:
   - "List all products" → type="product"
   - "List features under component X" → type="feature", parent_id="<component-uuid>"
-  - "List all release groups" → type="releaseGroup"
-  - "List features, names only" → type="feature", fields=["name"]
+  - "Features with their effort" → type="feature", fields=["Effort"]
 
-NOTE: For objectives, use this tool (not pb_search_entities) — the search endpoint
-silently returns empty results for objective type.`,
+For operators (contains, date ranges, custom-field comparisons) use pb_search_entities.`,
       inputSchema: z.object({
         type: z.enum(ENTITY_TYPES).describe('Entity type to list'),
         parent_id: z.string().uuid().optional().describe('Filter to direct children of this parent UUID'),
-        fields: z.array(z.string()).optional().describe('Field projection: ["all"] for all fields, ["name","status"] for specific fields, omit for non-null fields only'),
+        name: z.string().min(1).optional().describe('Name contains this text'),
+        status_name: z.string().min(1).optional().describe('Exact status name'),
+        owner_email: z.string().email().optional().describe('Owner email'),
+        archived: z.boolean().optional().describe('true = only archived, false = only non-archived; omit for both'),
+        fields: jsonArrayArg(z.string()).optional().describe('Extra fields per row, by display name or id; ["all"] for every field'),
         ...paginationSchema,
         response_format: responseFormatSchema,
       }).strict(),
@@ -98,47 +95,45 @@ silently returns empty results for objective type.`,
         openWorldHint: true,
       },
     },
-    async ({ type, parent_id, fields, limit, page_cursor, response_format }) => {
+    async ({ type, parent_id, name, status_name, owner_email, archived, fields, limit, page_cursor, response_format }) => {
       try {
-        const params: string[] = [`type[]=${type}`];
-        if (parent_id) params.push(`parent[id]=${encodeURIComponent(parent_id)}`);
-        if (fields?.length) fields.forEach((f) => params.push(`fields[]=${encodeURIComponent(f)}`));
+        const names = fieldNameResolver();
+        const fieldNames = fields?.length ? await names(type) : {};
+        const all = !!fields?.some((f) => f.toLowerCase() === 'all');
+        const extraKeys = all ? [] : (fields ?? []).map((f) => resolveFieldKey(f, fieldNames) ?? f);
+        const projection = extraKeys.length
+          ? [...new Set(['name', 'status', 'owner', 'teams', 'archived', ...extraKeys])]
+          : undefined;
 
-        const path = page_cursor
-          ? `/v2/entities?${params.join('&')}&pageCursor=${encodeURIComponent(page_cursor)}`
-          : `/v2/entities?${params.join('&')}`;
+        const pager = getPager('/v2/entities', {
+          'type[]': type, 'parent[id]': parent_id, name, 'status[name]': status_name, 'owner[email]': owner_email,
+          // archived=false is ignored by GET /v2/entities (live-verified), so it is applied client-side.
+          archived: archived === true ? 'true' : undefined, 'fields[]': projection,
+        }, `list ${type}`);
 
-        const { data: rawData, nextUrl } = await fetchPage<PBEntity>(path, `list ${type}`);
-        const data = rawData.slice(0, limit);
-        const nextCursor = extractCursor(nextUrl);
-
-        const output = {
-          data,
-          count: data.length,
-          has_more: !!nextCursor,
-          next_cursor: nextCursor ?? undefined,
-        };
-
-        let text: string;
-        if (response_format === ResponseFormat.MARKDOWN) {
-          const lines = [
-            `# Productboard ${type}s (${data.length} results${nextCursor ? ', more available' : ''})`,
-            '',
-          ];
-          for (const e of data) lines.push(entityToMarkdown(e), '');
-          if (nextCursor) lines.push(`---\n_Next page cursor: \`${nextCursor}\`_`);
-          text = lines.join('\n');
-        } else {
-          text = JSON.stringify(output, null, 2);
-        }
-
-        if (text.length > CHARACTER_LIMIT) {
-          text = text.slice(0, CHARACTER_LIMIT) + '\n\n... [truncated — use page_cursor or reduce limit]';
-        }
-
-        return { content: [{ type: 'text', text }], structuredContent: output as unknown as Record<string, unknown> };
+        const res = await scan({
+          sources: [pager], start: page_cursor, limit, maxPages: Math.ceil(limit / 100) + 2,
+          test: archived === undefined ? undefined : (e) => !!e.fields?.archived === archived,
+          map: (e) => ({
+            ...entityRow(e),
+            ...(all ? { fields: namedFields(e.fields, fieldNames, 1000) }
+              : extraKeys.length ? { fields: Object.fromEntries(extraKeys.map((k) => [fieldNames[k] ?? k, fieldValue(e, k, fieldNames)])) } : {}),
+          }),
+        });
+        const rows = res.rows.map((r) => r.row);
+        return respondList({
+          format: response_format, rows,
+          cursorAt: (k) => encodeCursor(k < res.rows.length ? res.rows[k].pos : res.resume),
+          build: (shown, next, note) => ({ data: shown, count: shown.length, has_more: !!next, next_cursor: next ?? undefined, ...(note ? { truncated: note } : {}) }),
+          markdown: (o) => [
+            `# Productboard ${type}s (${o.count} results${o.has_more ? ', more available' : ''})`, '',
+            ...o.data.map(entityRowMd),
+            ...(o.truncated ? ['', `_${o.truncated}_`] : []),
+            ...(o.next_cursor ? ['', `_Next page cursor: \`${o.next_cursor}\`_`] : []),
+          ].join('\n'),
+        });
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );
@@ -148,242 +143,65 @@ silently returns empty results for objective type.`,
     'pb_search_entities',
     {
       title: 'Search Productboard Entities',
-      description: `Search Productboard entities using POST /v2/entities/search with filters.
+      description: `Search Productboard entities with exact filters and operator conditions.
 
-Supported types: product, component, feature, subfeature, initiative, keyResult, release, releaseGroup, company, user
-NOTE: Do NOT use this for type="objective" — the search endpoint silently returns empty for
-objectives. Use pb_list_entities with type="objective" instead.
+Exact filters (status, owner, parent, name, archived=true) are applied by Productboard before
+scanning; everything else — including all conditions — is evaluated on each fetched page.
+All filters and conditions are combined with AND.
+
+Conditions: [{ field, operator, value }]
+  - field: display name or id ("name", "Status", "Owner", "Effort", a custom field name, "createdAt",
+    "updatedAt", or a dotted sub-key such as "timeframe.startDate"). Unknown fields are rejected.
+  - operator: ${OPERATORS.join(', ')}
+  - value: text/number/ISO date; a list for in/not_in; a period like "7 days", "2 weeks",
+    "3 months" for in_last/in_next; omit for is_empty/is_not_empty.
 
 Args:
-  - types (string[]): One or more entity types to search (exclude "objective" — use pb_list_entities)
-    NOTE: The API supports one type at a time for POST search; multi-type is best-effort.
-  - ids (string[], optional): Fetch specific entities by UUID array (OR logic, max 100)
-  - name (string, optional): Filter by partial name match
-  - owner_email (string, optional): Filter by owner email (requires members:pii:read scope)
-  - owner_id (string, optional): Filter by owner UUID (use instead of email when PII scope unavailable)
-  - status_name (string, optional): Filter by status name (e.g. "In Progress", "Done")
-  - status_id (string, optional): Filter by status UUID (use when status name is ambiguous)
-  - parent_id (string, optional): Filter to direct children of this parent UUID
-  - archived (boolean, optional): Include archived entities (default false)
-  - created_from (string, optional): ISO 8601 datetime — entities created on or after
-  - created_to (string, optional): ISO 8601 datetime — entities created on or before
-  - updated_from (string, optional): ISO 8601 datetime — entities updated on or after
-  - updated_to (string, optional): ISO 8601 datetime — entities updated on or before
-  - source_system (string, optional): Filter by metadata.source.system (e.g. "jira")
-  - source_record_id (string, optional): Filter by metadata.source.recordId
-  - limit (number): Max results per page (default 50)
-  - page_cursor (string, optional): Cursor for next page
+  - types (string[]): Entity types to search (scanned one after another)
+  - conditions (array, optional): Operator conditions (see above)
+  - name (string, optional): Name contains this text
+  - status_name / status_id, owner_email / owner_id, parent_id (optional): Exact filters
+  - archived (boolean): false = only non-archived (default), true = only archived
+  - ids (string[], optional): Specific entity UUIDs (max 100)
+  - source_system / source_record_id (optional): metadata.source filters
+  - created_from / created_to / updated_from / updated_to (optional): ISO 8601 bounds
+  - limit (number): Stop after this many matches (default 50, max 200)
+  - max_pages (number): Max API pages (100 entities each) to scan per call (default 10, max 40)
+  - page_cursor (string, optional): resume_cursor from a previous call, to keep scanning
   - response_format ('markdown' | 'json'): Output format (default 'markdown')
 
 Returns:
-  Matching entities with fields (including createdAt/updatedAt), plus next_cursor if more pages exist.
-  All filters use AND logic — OR is not supported.
-
-IMPORTANT — date filter limitation (as of May 2026):
-  Neither POST /v2/entities/search nor GET /v2/entities support date-based filters
-  (createdFrom/updatedFrom are rejected with 400 on GET; silently ignored on POST).
-  When created_from, created_to, updated_from, or updated_to are specified, this tool
-  auto-paginates all results and filters client-side by the entity's createdAt/updatedAt.
-  This works correctly but is slower for large workspaces. Health updates are best filtered
-  using health.lastUpdatedAt in the returned fields rather than updated_from.
+  { data: rows[] (compact rows + createdAt/updatedAt + "matched" values of the condition fields),
+    count, scanned, pages_scanned, complete, resume_cursor }.
+  If complete=false, pass resume_cursor as page_cursor to continue; resumed scans neither skip
+  nor repeat items.
 
 Examples:
-  - "Find features named 'SSO'" → types=["feature"], name="SSO"
-  - "Fetch specific entities" → ids=["uuid1","uuid2"]
-  - "Features owned by klara@acme.com" → types=["feature"], owner_email="klara@acme.com"
-  - "In-Progress features" → types=["feature"], status_name="In Progress"
-  - "Features under component X" → types=["feature"], parent_id="<uuid>"
-  - "Features created this week" → types=["feature"], created_from="2026-05-03T00:00:00Z"`,
+  - Name contains "checkout": types=["feature"], conditions=[{"field":"name","operator":"contains","value":"checkout"}]
+  - Updated in the last week: conditions=[{"field":"updatedAt","operator":"in_last","value":"7 days"}]
+  - Status in a set: conditions=[{"field":"Status","operator":"in","value":["Planned","In progress"]}]
+  - Unowned: conditions=[{"field":"Owner","operator":"is_empty"}]
+  - Custom number field: conditions=[{"field":"Effort","operator":"gt","value":5}]`,
       inputSchema: z.object({
-        types: z.array(z.enum(ENTITY_TYPES)).min(1).describe('Entity types to search (avoid "objective" — use pb_list_entities instead)'),
-        ids: z.array(z.string().uuid()).max(100).optional().describe('Filter by specific entity UUIDs (OR logic, max 100)'),
-        name: z.string().optional().describe('Filter by name (partial match)'),
-        owner_email: z.string().email().optional().describe('Filter by owner email (requires members:pii:read scope)'),
+        types: jsonArrayArg(z.enum(ENTITY_TYPES)).describe('Entity types to search'),
+        conditions: conditionsArg.optional(),
+        ids: z.array(z.string().uuid()).max(100).optional().describe('Filter by specific entity UUIDs (max 100)'),
+        name: z.string().optional().describe('Name contains this text'),
+        owner_email: z.string().email().optional().describe('Filter by owner email'),
         owner_id: z.string().uuid().optional().describe('Filter by owner UUID'),
-        status_name: z.string().optional().describe('Filter by status name (e.g. "In Progress")'),
+        status_name: z.string().optional().describe('Filter by exact status name (e.g. "In Progress")'),
         status_id: z.string().uuid().optional().describe('Filter by status UUID'),
         parent_id: z.string().uuid().optional().describe('Filter to direct children of this parent entity UUID'),
-        archived: z.boolean().optional().default(false).describe('Include archived entities'),
+        archived: z.boolean().optional().default(false).describe('false = only non-archived (default), true = only archived'),
         created_from: z.string().optional().describe('ISO 8601 datetime — entities created on or after'),
         created_to: z.string().optional().describe('ISO 8601 datetime — entities created on or before'),
         updated_from: z.string().optional().describe('ISO 8601 datetime — entities updated on or after'),
         updated_to: z.string().optional().describe('ISO 8601 datetime — entities updated on or before'),
         source_system: z.string().optional().describe('Filter by metadata.source.system'),
         source_record_id: z.string().optional().describe('Filter by metadata.source.recordId'),
-        ...paginationSchema,
-        response_format: responseFormatSchema,
-      }).strict(),
-      annotations: {
-        readOnlyHint: true,
-        destructiveHint: false,
-        idempotentHint: false,
-        openWorldHint: true,
-      },
-    },
-    async ({ types, ids, name, owner_email, owner_id, status_name, status_id, parent_id, archived, created_from, created_to, updated_from, updated_to, source_system, source_record_id, limit, page_cursor, response_format }) => {
-      try {
-        // April 2026 change: POST /v2/entities/search's legacy flat properties were removed.
-        // The new accepted shape inside `data` is:
-        //   filter: { type: [...], id?: [...], metadata?: { source: { system?, recordId? } } }
-        //   search: { query: <name> }
-        // owner / status / parent / archived / name-as-field are no longer accepted by POST and
-        // must be filtered via GET /v2/entities (which keeps `owner[*]`, `status[*]`, `parent[id]`,
-        // `archived`, `name`). However GET does NOT accept `id[]` or `metadata[source][*]`, so
-        // ids/source filters force the POST path with client-side filtering for the rest.
-        // Verified live against staging on 2026-05-14.
-
-        const postOnlyFilter = !!(ids?.length || source_system || source_record_id);
-        const getOnlyFilter = !!(owner_email || owner_id || status_name || status_id || parent_id || archived === true);
-        const hasDateFilter = !!(created_from || created_to || updated_from || updated_to);
-        // Objective quirk: POST search returns empty for objectives — always route them through GET.
-        const objectiveIncluded = types.includes('objective');
-        const nonObjectiveTypes = types.filter((t) => t !== 'objective');
-
-        const applyClientSide = (rows: PBEntity[]): PBEntity[] => rows.filter((e) => {
-          const f = (e.fields ?? {}) as Record<string, unknown>;
-          if (archived === false && f['archived']) return false;
-          if (archived === true && !f['archived']) return false;
-          if (owner_id && (f['owner'] as { id?: string } | undefined)?.id !== owner_id) return false;
-          if (owner_email && (f['owner'] as { email?: string } | undefined)?.email !== owner_email) return false;
-          if (status_id && (f['status'] as { id?: string } | undefined)?.id !== status_id) return false;
-          if (status_name && (f['status'] as { name?: string } | undefined)?.name !== status_name) return false;
-          if (parent_id && (f['parent'] as { id?: string } | undefined)?.id !== parent_id) return false;
-          if (name && !((f['name'] as string | undefined) ?? '').toLowerCase().includes(name.toLowerCase())) return false;
-          if (created_from && e.createdAt && e.createdAt < created_from) return false;
-          if (created_to && e.createdAt && e.createdAt > created_to) return false;
-          if (updated_from && e.updatedAt && e.updatedAt < updated_from) return false;
-          if (updated_to && e.updatedAt && e.updatedAt > updated_to) return false;
-          return true;
-        });
-
-        let allData: PBEntity[] = [];
-        let nextCursor: string | null = null;
-
-        // ── POST path: ids[] or metadata.source filters require POST /v2/entities/search.
-        if (postOnlyFilter && nonObjectiveTypes.length > 0) {
-          const filter: Record<string, unknown> = { type: nonObjectiveTypes };
-          if (ids?.length) filter['id'] = ids;
-          if (source_system || source_record_id) {
-            const source: Record<string, string> = {};
-            if (source_system) source['system'] = source_system;
-            if (source_record_id) source['recordId'] = source_record_id;
-            filter['metadata'] = { source };
-          }
-          const body: Record<string, unknown> = { data: { filter } };
-          if (name) (body['data'] as Record<string, unknown>)['search'] = { query: name };
-
-          // When any GET-only or date filter is also requested, we must consume all pages
-          // and filter client-side — otherwise the user's cursor would return wrong-shape data.
-          const mustConsumeAll = getOnlyFilter || hasDateFilter;
-          let cursor: string | null = page_cursor ?? null;
-          do {
-            const url = cursor
-              ? `/v2/entities/search?pageCursor=${encodeURIComponent(cursor)}`
-              : '/v2/entities/search';
-            const r = await withRetry(
-              () => pbFetch<PBPage<PBEntity>>('POST', url, body),
-              'search entities (POST)'
-            );
-            allData.push(...(r.data ?? []));
-            cursor = extractCursor(r.links?.next ?? null);
-            if (!mustConsumeAll) { nextCursor = cursor; break; }
-          } while (cursor);
-          allData = applyClientSide(allData);
-        }
-        // ── GET path: no ids/source filters → use GET /v2/entities per type (server-side
-        // filtering for owner/status/parent/archived/name; date filters still client-side
-        // except on objectives which support createdFrom/updatedFrom server-side).
-        else if (nonObjectiveTypes.length > 0) {
-          for (const t of nonObjectiveTypes) {
-            const params: string[] = [`type[]=${encodeURIComponent(t)}`];
-            if (archived) params.push('archived=true');
-            if (name) params.push(`name=${encodeURIComponent(name)}`);
-            if (owner_email) params.push(`owner[email]=${encodeURIComponent(owner_email)}`);
-            if (owner_id) params.push(`owner[id]=${encodeURIComponent(owner_id)}`);
-            if (status_name) params.push(`status[name]=${encodeURIComponent(status_name)}`);
-            if (status_id) params.push(`status[id]=${encodeURIComponent(status_id)}`);
-            if (parent_id) params.push(`parent[id]=${encodeURIComponent(parent_id)}`);
-            const path = `/v2/entities?${params.join('&')}`;
-            const rows = await fetchAllPages<PBEntity>(path, `search ${t}`);
-            allData.push(...rows);
-          }
-          if (hasDateFilter) allData = applyClientSide(allData);
-          nextCursor = null; // per-type GET loop consumes all pages
-        }
-
-        // ── Objectives: always GET (POST silently returns empty). Date filters are server-side here.
-        if (objectiveIncluded) {
-          const params: string[] = ['type[]=objective'];
-          if (archived) params.push('archived=true');
-          if (owner_email) params.push(`owner[email]=${encodeURIComponent(owner_email)}`);
-          if (owner_id) params.push(`owner[id]=${encodeURIComponent(owner_id)}`);
-          if (status_name) params.push(`status[name]=${encodeURIComponent(status_name)}`);
-          if (status_id) params.push(`status[id]=${encodeURIComponent(status_id)}`);
-          if (parent_id) params.push(`parent[id]=${encodeURIComponent(parent_id)}`);
-          if (name) params.push(`name=${encodeURIComponent(name)}`);
-          if (created_from) params.push(`createdFrom=${encodeURIComponent(created_from)}`);
-          if (created_to) params.push(`createdTo=${encodeURIComponent(created_to)}`);
-          if (updated_from) params.push(`updatedFrom=${encodeURIComponent(updated_from)}`);
-          if (updated_to) params.push(`updatedTo=${encodeURIComponent(updated_to)}`);
-          const objPath = `/v2/entities?${params.join('&')}`;
-          let objRows = await fetchAllPages<PBEntity>(objPath, 'list objectives');
-          // ids filter not supported by GET — apply client-side for objectives.
-          if (ids?.length) {
-            const idSet = new Set(ids);
-            objRows = objRows.filter((e) => idSet.has(e.id));
-          }
-          allData.push(...objRows);
-        }
-
-        const data = allData.slice(0, limit);
-        const output = {
-          data,
-          count: data.length,
-          has_more: !!nextCursor,
-          next_cursor: nextCursor ?? undefined,
-          note: objectiveIncluded ? 'Objectives fetched via GET endpoint (POST search quirk)' : undefined,
-        };
-
-        let text: string;
-        if (response_format === ResponseFormat.MARKDOWN) {
-          const lines = [`# Search Results (${data.length}${nextCursor ? ', more available' : ''})`, ''];
-          for (const e of data) lines.push(entityToMarkdown(e), '');
-          if (nextCursor) lines.push(`---\n_Next page cursor: \`${nextCursor}\`_`);
-          text = lines.join('\n');
-        } else {
-          text = JSON.stringify(output, null, 2);
-        }
-
-        if (text.length > CHARACTER_LIMIT) {
-          text = text.slice(0, CHARACTER_LIMIT) + '\n\n... [truncated]';
-        }
-
-        return { content: [{ type: 'text', text }], structuredContent: output as unknown as Record<string, unknown> };
-      } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
-      }
-    }
-  );
-
-  // ── pb_get_entity ─────────────────────────────────────────────────────────
-  server.registerTool(
-    'pb_get_entity',
-    {
-      title: 'Get Productboard Entity',
-      description: `Get a single Productboard entity by its UUID.
-
-Args:
-  - id (string): The entity UUID
-  - fields (string[], optional): Field projection — return only these fields.
-    Pass ["all"] to include fields with null values, ["name","status"] for specific fields,
-    or omit to return all non-null fields (default).
-  - response_format ('markdown' | 'json'): Output format (default 'markdown')
-
-Returns:
-  The entity's fields, metadata, and links.`,
-      inputSchema: z.object({
-        id: z.string().uuid().describe('Entity UUID'),
-        fields: z.array(z.string()).optional().describe('Field projection: ["all"], ["name","status"], or omit for non-null fields'),
+        limit: z.number().int().min(1).max(200).default(50).describe('Stop after this many matches (1–200, default 50)'),
+        max_pages: z.number().int().min(1).max(40).default(10).describe('Max API pages to scan per call (default 10)'),
+        page_cursor: z.string().optional().describe('resume_cursor from a previous call'),
         response_format: responseFormatSchema,
       }).strict(),
       annotations: {
@@ -393,25 +211,223 @@ Returns:
         openWorldHint: true,
       },
     },
-    async ({ id, fields, response_format }) => {
+    async (a) => {
       try {
-        const qs = fields?.length ? `?${fields.map((f) => `fields[]=${encodeURIComponent(f)}`).join('&')}` : '';
-        const r = await withRetry(
-          () => pbFetch<{ data: PBEntity }>('GET', `/v2/entities/${id}${qs}`),
-          `get entity ${id}`
-        );
-        const entity = r.data;
+        if (!a.types.length) return errorResult('Error: types must contain at least one entity type');
+        const conds: Condition[] = a.conditions ?? [];
+        checkConditions(conds);
+        const types = [...new Set(a.types)];
 
-        let text: string;
-        if (response_format === ResponseFormat.MARKDOWN) {
-          text = [`# Entity: ${(entity.fields['name'] as string) ?? id}`, '', entityToMarkdown(entity)].join('\n');
-        } else {
-          text = JSON.stringify(entity, null, 2);
+        // Field names per type; validate condition fields up front so a typo fails fast.
+        const namesFor = fieldNameResolver();
+        const namesByType: Record<string, Record<string, string>> = {};
+        for (const t of types) namesByType[t] = await namesFor(t);
+        if (conds.length) {
+          for (const t of types) {
+            const names = namesByType[t];
+            const known = new Set(['createdat', 'updatedat', ...Object.keys(names).map((k) => k.toLowerCase()), ...Object.values(names).map((n) => n.toLowerCase())]);
+            const unknown = conds.map((c) => c.field).filter((f) => !known.has(f.toLowerCase()) && !known.has(f.split('.')[0].toLowerCase()));
+            if (unknown.length) {
+              return errorResult(`Error: Unknown field(s) for ${t}: ${unknown.join(', ')}. Use pb_get_entity_configurations with types=["${t}"] to see field names.`);
+            }
+          }
         }
 
-        return { content: [{ type: 'text', text }], structuredContent: entity as unknown as Record<string, unknown> };
+        const postOnly = !!(a.ids?.length || a.source_system || a.source_record_id);
+        const sources: PageFetcher[] = types.map((t) => {
+          if (postOnly && t !== 'objective') {
+            const filter: Record<string, unknown> = { type: [t] };
+            if (a.ids?.length) filter['id'] = a.ids;
+            if (a.source_system || a.source_record_id) {
+              filter['metadata'] = { source: {
+                ...(a.source_system ? { system: a.source_system } : {}),
+                ...(a.source_record_id ? { recordId: a.source_record_id } : {}),
+              } };
+            }
+            // The body is re-sent with every pageCursor (a cursor alone returns unfiltered results).
+            return postPager('/v2/entities/search', { data: { filter } }, `search ${t}`);
+          }
+          // GET /v2/entities: server-side exact filters. Objectives always use GET because
+          // POST /v2/entities/search silently returns nothing for them.
+          return getPager('/v2/entities', {
+            'type[]': t, name: a.name, 'owner[email]': a.owner_email, 'owner[id]': a.owner_id,
+            'status[name]': a.status_name, 'status[id]': a.status_id, 'parent[id]': a.parent_id,
+            archived: a.archived === true ? 'true' : undefined,
+          }, `search ${t}`);
+        });
+
+        const idSet = a.ids?.length ? new Set(a.ids) : null;
+        const lc = (s?: string) => (s ?? '').toLowerCase();
+        const now = Date.now();
+        const test = (e: PBEntity & Json): boolean => {
+          const f = (e.fields ?? {}) as Json;
+          if (!!f.archived !== !!a.archived) return false;
+          if (idSet && !idSet.has(e.id)) return false;
+          if (a.name && !lc(f.name).includes(lc(a.name))) return false;
+          if (a.owner_email && lc(f.owner?.email) !== lc(a.owner_email)) return false;
+          if (a.owner_id && f.owner?.id !== a.owner_id) return false;
+          if (a.status_name && lc(f.status?.name) !== lc(a.status_name)) return false;
+          if (a.status_id && f.status?.id !== a.status_id) return false;
+          if (a.parent_id && postOnly && parentIdOf(e) !== a.parent_id) return false;
+          if (a.source_system && e.metadata?.source?.system !== a.source_system) return false;
+          if (a.source_record_id && e.metadata?.source?.recordId !== a.source_record_id) return false;
+          if (a.created_from && !(e.createdAt && e.createdAt >= a.created_from)) return false;
+          if (a.created_to && !(e.createdAt && e.createdAt <= a.created_to)) return false;
+          if (a.updated_from && !(e.updatedAt && e.updatedAt >= a.updated_from)) return false;
+          if (a.updated_to && !(e.updatedAt && e.updatedAt <= a.updated_to)) return false;
+          const names = namesByType[e.type] ?? {};
+          return conds.every((c) => matches(fieldValue(e, c.field, names), c.operator, c.value, now));
+        };
+
+        const res = await scan({
+          sources, start: a.page_cursor, limit: a.limit, maxPages: a.max_pages, budget: SCAN_BUDGET, test,
+          map: (e: Json) => ({
+            ...entityRow(e), createdAt: e.createdAt, updatedAt: e.updatedAt,
+            matched: matchedValues(e, conds, namesByType[e.type] ?? {}),
+          }),
+        });
+
+        return respondList({
+          format: a.response_format, rows: res.rows.map((r) => r.row),
+          cursorAt: (k) => encodeCursor(k < res.rows.length ? res.rows[k].pos : res.resume),
+          build: (shown, next, note) => ({
+            data: shown, count: shown.length, scanned: res.scanned, pages_scanned: res.pagesScanned,
+            complete: !next, resume_cursor: next, ...(note ? { truncated: note } : {}),
+          }),
+          markdown: (o) => [
+            `# Search Results (${o.count} matches, ${o.scanned} scanned${o.complete ? ', complete' : ', more to scan'})`, '',
+            ...o.data.map(entityRowMd),
+            ...(o.truncated ? ['', `_${o.truncated}_`] : []),
+            ...(o.resume_cursor ? ['', `_Scan not complete — continue with page_cursor: \`${o.resume_cursor}\`_`] : []),
+          ].join('\n'),
+        });
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
+      }
+    }
+  );
+
+  // ── pb_get_entity ─────────────────────────────────────────────────────────
+  server.registerTool(
+    'pb_get_entity',
+    {
+      title: 'Get Productboard Entity',
+      description: `Get a single Productboard entity by its UUID, with every field under its display name
+(custom fields resolved from UUIDs to names, rich text converted to markdown) and its relationships,
+each with the related entity's name.
+
+Health is returned as { status, mode, comment, previous_status, updated_at, updated_by }. Only the
+current and previous status are available — the public API has no health history.
+
+Dependencies (isBlocking / isBlockedBy) are reported as the Productboard UI shows them; the raw API
+reports them inverted (raw=true returns the API's own, inverted, values).
+
+Args:
+  - id (string): The entity UUID
+  - fields (string[], optional): Only these fields, by display name or id
+  - include_relationships (boolean): Include parent/child/link/blocking relationships (default true)
+  - raw (boolean): Return the unmodified API response instead (custom fields keyed by UUID)
+  - response_format ('markdown' | 'json'): Output format (default 'markdown')
+
+Returns:
+  { id, type, name, createdAt, updatedAt, url, source, fields: { "Display name": value },
+    relationships: [{ type, target_type, target_id, target_name }] }`,
+      inputSchema: z.object({
+        id: z.string().uuid().describe('Entity UUID'),
+        fields: jsonArrayArg(z.string()).optional().describe('Only these fields, by display name or id'),
+        include_relationships: z.boolean().default(true).describe('Include relationships'),
+        raw: z.boolean().default(false).describe('Return the unmodified API response'),
+        response_format: responseFormatSchema,
+      }).strict(),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    async ({ id, fields, include_relationships, raw, response_format }) => {
+      try {
+        const r = await withRetry(() => pbFetch<{ data: PBEntity & Json }>('GET', `/v2/entities/${id}`), `get entity ${id}`);
+        const e = r.data;
+        if (raw) return respondObject(response_format, r, (o) => '```json\n' + JSON.stringify(o, null, 1) + '\n```');
+
+        const names = await fieldNameResolver()(e.type);
+        let f = e.fields ?? {};
+        if (fields?.length) {
+          const keys = fields.map((x) => resolveFieldKey(x, names) ?? x);
+          f = Object.fromEntries(keys.filter((k) => k in f).map((k) => [k, f[k]]));
+        }
+        const out = {
+          id: e.id, type: e.type, name: e.fields?.name, createdAt: e.createdAt, updatedAt: e.updatedAt,
+          url: e.links?.html, source: e.metadata?.source,
+          fields: namedFields(f, names),
+          ...(include_relationships ? await relationshipRows(id).then((r) => ({ relationships: r.items, ...(r.names_truncated ? { names_truncated: r.names_truncated } : {}) })) : {}),
+        };
+        return respondObject(response_format, out, (o) => {
+          const lines = [`# ${o.name ?? o.id} \`${o.id}\``, `- **Type**: ${o.type}`];
+          if (o.createdAt) lines.push(`- **Created**: ${o.createdAt}`);
+          if (o.updatedAt) lines.push(`- **Updated**: ${o.updatedAt}`);
+          if (o.url) lines.push(`- **URL**: ${o.url}`);
+          if (o.source?.system) lines.push(`- **Source**: ${o.source.system} / ${o.source.recordId}`);
+          lines.push('', '## Fields');
+          for (const [k, v] of Object.entries(o.fields as Record<string, Json>)) {
+            if (k === 'Name') continue;
+            const s = typeof v === 'string' ? v : JSON.stringify(v);
+            lines.push(s.includes('\n') ? `- **${k}**:\n\n${s}\n` : `- **${k}**: ${s}`);
+          }
+          if (o.relationships) {
+            lines.push('', `## Relationships (${o.relationships.length})`);
+            for (const rel of o.relationships) lines.push(`- ${rel.type} → **${rel.target_name ?? '?'}** \`${rel.target_id}\` (${rel.target_type})`);
+            if (o.names_truncated) lines.push(`_${o.names_truncated}_`);
+          }
+          return lines.join('\n');
+        });
+      } catch (err) {
+        return errorResult(handleError(err));
+      }
+    }
+  );
+
+  // ── pb_read_entity_document ───────────────────────────────────────────────
+  server.registerTool(
+    'pb_read_entity_document',
+    {
+      title: 'Read Productboard Entity Documents',
+      description: `Read the rich-text "documents" stored on an entity — its Description, Specification and any
+rich-text custom fields — converted from HTML to markdown.
+
+Standalone Productboard documents (the Docs area) are NOT available through the public API;
+this tool only reads rich text attached to a feature, initiative, product, etc.
+
+Args:
+  - id (string): Entity UUID
+  - response_format ('markdown' | 'json'): Output format (default 'markdown')
+
+Returns:
+  { id, type, name, url, documents: [{ field, markdown }], empty }`,
+      inputSchema: z.object({
+        id: z.string().uuid().describe('Entity UUID'),
+        response_format: responseFormatSchema,
+      }).strict(),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ id, response_format }) => {
+      try {
+        const e = (await withRetry(() => pbFetch<{ data: PBEntity & Json }>('GET', `/v2/entities/${id}`), `get entity ${id}`)).data;
+        const names = await fieldNameResolver()(e.type);
+        const documents = Object.entries(e.fields ?? {})
+          .filter(([k, v]) => typeof v === 'string' && (k === 'description' || k === 'specification' || isHtml(v)))
+          .map(([k, v]) => ({ field: names[k] ?? k, markdown: htmlToMarkdown(v as string) }))
+          .filter((d) => d.markdown);
+        const out = { id: e.id, type: e.type, name: e.fields?.name, url: e.links?.html, documents, empty: documents.length === 0 };
+        return respondObject(response_format, out, (o) => [
+          `# ${o.name ?? o.id} \`${o.id}\` (${o.type})`, o.url ? `${o.url}` : '', '',
+          ...(o.empty ? ['_This entity has no description, specification or rich-text fields._']
+            : o.documents.flatMap((d: Json) => [`## ${d.field}`, '', d.markdown, ''])),
+        ].join('\n'));
+      } catch (err) {
+        return errorResult(handleError(err));
       }
     }
   );
@@ -489,7 +505,7 @@ Returns: The created entity with its assigned UUID.`,
     async ({ type, name, parent_id, email, owner_email, status, teams, timeframe_start, timeframe_end, timeframe_granularity, health_status, health_comment, phase, fields, source_system, source_record_id, source_url }) => {
       try {
         if ((ENTITY_TYPES_REQUIRING_PARENT as readonly string[]).includes(type) && !parent_id) {
-          return { content: [{ type: 'text', text: `Error: parent_id is required when creating a ${type}` }] };
+          return errorResult(`Error: parent_id is required when creating a ${type}`);
         }
 
         const entityType = type as string;
@@ -544,7 +560,7 @@ Returns: The created entity with its assigned UUID.`,
         const text = `Created ${type} \`${entity.id}\`: **${(entity.fields?.['name'] as string) ?? name}**`;
         return { content: [{ type: 'text', text }], structuredContent: entity as unknown as Record<string, unknown> };
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );
@@ -602,7 +618,7 @@ Examples:
     async ({ id, fields, patch }) => {
       try {
         if (fields === undefined && (patch === undefined || patch.length === 0)) {
-          return { content: [{ type: 'text', text: 'Error: Provide either fields or patch (at least one op)' }] };
+          return errorResult('Error: Provide either fields or patch (at least one op)');
         }
 
         const body: Record<string, unknown> = { data: {} };
@@ -616,7 +632,7 @@ Examples:
 
         return { content: [{ type: 'text', text: `Updated entity \`${id}\` successfully.` }] };
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );
@@ -663,7 +679,7 @@ Returns: Confirmation message on success. 404 means the entity was already gone.
         if (pbErr.status === 404) {
           return { content: [{ type: 'text', text: `Entity \`${id}\` not found — already deleted or ID is incorrect.` }] };
         }
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );
@@ -673,23 +689,25 @@ Returns: Confirmation message on success. 404 means the entity was already gone.
     'pb_get_entity_configurations',
     {
       title: 'Get Productboard Entity Field Configurations',
-      description: `Get field definitions (schema, constraints, names) for one or more entity types.
+      description: `Get field definitions (id, display name, data type) for one or more entity types.
 
-Use this to discover what fields exist, their types, and their IDs before creating or
-updating entities. Custom fields use UUID identifiers.
+Use this to discover what fields exist and their IDs before creating, updating or searching
+entities. Custom fields use UUID identifiers; their display names are what pb_get_entity shows
+and what pb_search_entities conditions accept.
 
 Args:
-  - types (string[]): Entity types to get configurations for (default: all hierarchy types)
+  - types (string[]): Entity types (default: feature, component, product, objective, company)
+  - include_schema (boolean): Also include each field's JSON schema and constraints (large; default false)
   - response_format ('markdown' | 'json'): Output format (default 'markdown')
 
 Returns:
-  For each type: list of fields with id, name, type, schema, and constraints.
+  { data: [{ type, fields: [{ id, name, data_type }] }] }
 
 Examples:
-  - Discover company fields: types=["company"]
-  - See all field configs: types=["feature", "component", "product"]`,
+  - Discover company fields: types=["company"]`,
       inputSchema: z.object({
-        types: z.array(z.enum(ENTITY_TYPES)).min(1).default(['feature', 'component', 'product', 'objective', 'company']).describe('Entity types'),
+        types: jsonArrayArg(z.enum(ENTITY_TYPES)).default(['feature', 'component', 'product', 'objective', 'company']).describe('Entity types'),
+        include_schema: z.boolean().default(false).describe('Include JSON schema and constraints per field'),
         response_format: responseFormatSchema,
       }).strict(),
       annotations: {
@@ -699,39 +717,42 @@ Examples:
         openWorldHint: true,
       },
     },
-    async ({ types, response_format }) => {
+    async ({ types, include_schema, response_format }) => {
       try {
         const typeParams = types.map((t) => `type[]=${t}`).join('&');
         const r = await withRetry(
           () => pbFetch<{ data: PBEntityConfiguration[] }>('GET', `/v2/entities/configurations?${typeParams}`),
           'get entity configurations'
         );
-
-        const configs = r.data ?? [];
-
-        let text: string;
-        if (response_format === ResponseFormat.MARKDOWN) {
+        const dataType = (s: Json): string => {
+          if (!s) return 'unknown';
+          if (s.type === 'array') return `${dataType(s.items)}[]`;
+          if (s.format) return s.format;
+          if (s.type === 'object' && s.properties?.email) return 'member';
+          if (s.type === 'object' && s.properties?.name) return 'select';
+          if (s.type === 'object' && s.properties?.startDate) return 'timeframe';
+          return s.type ?? s.$ref?.split('/').pop() ?? 'object';
+        };
+        const data = (r.data ?? []).map((cfg) => ({
+          type: cfg.type,
+          fields: Object.entries(cfg.fields ?? {}).map(([fieldId, def]) => ({
+            id: fieldId, name: def.name, data_type: dataType(def.schema),
+            ...(include_schema ? { schema: def.schema, constraints: def.constraints } : {}),
+          })),
+        }));
+        return respondObject(response_format, { data }, (o) => {
           const lines = ['# Entity Field Configurations', ''];
-          for (const cfg of configs) {
-            lines.push(`## ${cfg.type}`, '');
-            for (const [fieldId, def] of Object.entries(cfg.fields ?? {})) {
-              const schema = def.schema ? JSON.stringify(def.schema) : 'N/A';
-              lines.push(`- **${def.name}** (\`${fieldId}\`) — schema: \`${schema}\``);
+          for (const cfg of o.data) {
+            lines.push(`## ${cfg.type} (${cfg.fields.length} fields)`, '');
+            for (const f of cfg.fields) {
+              lines.push(`- **${f.name}** \`${f.id}\` — ${f.data_type}${f.schema ? ` — schema: \`${JSON.stringify(f.schema)}\`` : ''}`);
             }
             lines.push('');
           }
-          text = lines.join('\n');
-        } else {
-          text = JSON.stringify(configs, null, 2);
-        }
-
-        if (text.length > CHARACTER_LIMIT) {
-          text = text.slice(0, CHARACTER_LIMIT) + '\n\n... [truncated]';
-        }
-
-        return { content: [{ type: 'text', text }], structuredContent: { data: configs } };
+          return lines.join('\n');
+        });
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );
@@ -741,7 +762,11 @@ Examples:
     'pb_list_entity_relationships',
     {
       title: 'List Productboard Entity Relationships',
-      description: `List all relationships for a Productboard entity (parent, children, links, blocking, blocked-by).
+      description: `List all relationships for a Productboard entity (parent, children, links, blocking, blocked-by),
+with each related entity's name. All pages are fetched (the inline relationships on an entity are capped at ~10).
+
+isBlocking / isBlockedBy follow the Productboard UI ("A isBlockedBy B" = A is blocked by B). The raw API
+reports these inverted; this tool translates both the results and the type filter.
 
 Args:
   - id (string): Entity UUID
@@ -749,7 +774,7 @@ Args:
   - response_format ('markdown' | 'json'): Output format (default 'markdown')
 
 Returns:
-  All relationships with type and target entity UUID/type.`,
+  { data: [{ type, target_type, target_id, target_name }], count }`,
       inputSchema: z.object({
         id: z.string().uuid().describe('Entity UUID'),
         type: z.enum(['parent', 'child', 'link', 'isBlockedBy', 'isBlocking']).optional().describe('Filter by relationship type'),
@@ -759,30 +784,23 @@ Returns:
     },
     async ({ id, type, response_format }) => {
       try {
-        const params = type ? `?type=${type}` : '';
-        const r = await withRetry(
-          () => pbFetch<{ data: PBNoteRelationship[] }>('GET', `/v2/entities/${id}/relationships${params}`),
-          `list entity relationships ${id}`
-        );
-        const data = r.data ?? [];
-        const output = { data, count: data.length };
-
-        let text: string;
-        if (response_format === ResponseFormat.MARKDOWN) {
-          const lines = [`# Relationships for \`${id}\` (${data.length})`, ''];
-          for (const rel of data) {
-            lines.push(`- **${rel.type}** → \`${rel.target.id}\` (${rel.target.type})`);
-          }
-          text = lines.join('\n');
-        } else {
-          text = JSON.stringify(output, null, 2);
-        }
-        return { content: [{ type: 'text', text }], structuredContent: output as unknown as Record<string, unknown> };
+        const { items: rows, names_truncated } = await relationshipRows(id, type);
+        return respondList({
+          format: response_format, rows, cursorAt: () => null,
+          truncatedNote: (shown, total) => `Showing ${shown} of ${total} relationships to fit the response size limit; filter by type to see the rest.`,
+          build: (shown, _next, note) => ({ data: shown, count: shown.length, total: rows.length, ...(names_truncated ? { names_truncated } : {}), ...(note ? { truncated: note } : {}) }),
+          markdown: (o) => [
+            `# Relationships for \`${id}\` (${o.count}${o.count < o.total ? ` of ${o.total}` : ''})`, '',
+            ...o.data.map((rel: Json) => `- **${rel.type}** → ${rel.target_name ?? '?'} \`${rel.target_id}\` (${rel.target_type})`),
+            ...(o.names_truncated ? ['', `_${o.names_truncated}_`] : []),
+          ].join('\n'),
+        });
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );
+
 
   // ── pb_create_entity_relationship ─────────────────────────────────────────
   server.registerTool(
@@ -793,8 +811,8 @@ Returns:
 
 Relationship types:
   - link: associate two entities (e.g. link a feature to an initiative)
-  - isBlockedBy: mark this entity as blocked by the target
-  - isBlocking: mark this entity as blocking the target
+  - isBlocking: this entity blocks the target. isBlockedBy: the target blocks this entity.
+    Same meaning as the Productboard UI (verified with a live write test).
   - child: add the target as a child of this entity
   - parent: set the parent (use pb_set_entity_parent for replacing the parent)
 
@@ -814,6 +832,8 @@ Returns:
     },
     async ({ id, type, target_id }) => {
       try {
+        // Writes use the UI direction as-is (verified 2026-10-12: POST isBlocking A→B shows in the UI as
+        // "A is blocking B"). Only API *reads* are inverted, and those are translated in lib/shape.ts.
         await withRetry(
           () => pbFetch<unknown>('POST', `/v2/entities/${id}/relationships`, {
             data: { type, target: { id: target_id } },
@@ -822,7 +842,7 @@ Returns:
         );
         return { content: [{ type: 'text', text: `Created ${type} relationship from \`${id}\` to \`${target_id}\`.` }] };
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );
@@ -859,7 +879,7 @@ Returns:
         );
         return { content: [{ type: 'text', text: `Set parent of \`${id}\` to \`${parent_id}\`.` }] };
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );
@@ -870,6 +890,9 @@ Returns:
     {
       title: 'Delete Productboard Entity Relationship',
       description: `Delete a specific relationship between two Productboard entities.
+
+For dependencies, use the same direction pb_list_entity_relationships shows (the UI direction):
+isBlocking if this entity blocks the target, isBlockedBy if the target blocks it.
 
 Args:
   - id (string): Source entity UUID
@@ -887,13 +910,15 @@ Returns:
     },
     async ({ id, type, target_id }) => {
       try {
+        // The DELETE path uses the UI direction, matching create (verified 2026-10-12: a dependency created
+        // as isBlocking A→B is removed by DELETE /entities/A/relationships/isBlocking/B → 204).
         await withRetry(
           () => pbFetch<unknown>('DELETE', `/v2/entities/${id}/relationships/${type}/${target_id}`),
           `delete entity relationship ${id}`
         );
         return { content: [{ type: 'text', text: `Deleted ${type} relationship from \`${id}\` to \`${target_id}\`.` }] };
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );

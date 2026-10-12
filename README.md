@@ -26,13 +26,14 @@ MCP server for the [Productboard Public API v2](https://developer.productboard.c
 
 | Tool | Description |
 |---|---|
-| `pb_list_entities` | List features, components, products, objectives, or companies |
-| `pb_search_entities` | Search by type, name, or metadata source |
-| `pb_get_entity` | Get a single entity by UUID |
+| `pb_list_entities` | List entities of one type as compact rows (id, name, status, owner, teams, archived, url); filters: parent, name, status, owner, archived; optional extra fields by display name |
+| `pb_search_entities` | Search with exact filters plus operator conditions (`contains`, `in`, `is_empty`, `gt`, `before`, `in_last "7 days"`, …) on any field by display name; resumable scans (`complete`, `resume_cursor`) |
+| `pb_get_entity` | Get a single entity with custom fields under their display names, rich text as markdown, and all relationships (`raw=true` for the API response) |
+| `pb_read_entity_document` | Read an entity's rich-text documents (Description, Specification, rich-text custom fields) as markdown. Standalone Productboard documents are not available via the public API |
 | `pb_create_entity` | Create a new entity |
 | `pb_update_entity` | Update entity fields (replace or granular patch) |
 | `pb_delete_entity` | Permanently delete an entity by UUID |
-| `pb_get_entity_configurations` | Get field schemas for entity types |
+| `pb_get_entity_configurations` | Get field ids, display names and data types per entity type (`include_schema` for full schemas) |
 | `pb_list_entity_relationships` | List all relationships (parent, children, links, blocking, blocked-by) |
 | `pb_create_entity_relationship` | Create a relationship between two entities |
 | `pb_set_entity_parent` | Set or replace an entity's parent |
@@ -42,13 +43,14 @@ MCP server for the [Productboard Public API v2](https://developer.productboard.c
 
 | Tool | Description |
 |---|---|
-| `pb_list_notes` | List notes with filters (source, owner, archived) |
-| `pb_get_note` | Get a note + its relationships |
+| `pb_list_notes` | List notes as compact rows with filters (source, owner, creator, processed, archived, created/updated dates) |
+| `pb_list_entity_feedback` | List the feedback notes linked to a feature or other entity |
+| `pb_get_note` | Get a note (content as markdown) + all its relationships |
 | `pb_create_note` | Create a customer feedback note |
 | `pb_update_note` | Update note title, content, owner, tags, archived |
 | `pb_delete_note` | Permanently delete a note |
 | `pb_set_note_customer` | Set/replace a note's customer relationship |
-| `pb_search_notes` | Search notes with text and filter criteria |
+| `pb_search_notes` | Search notes: text in title/content, `created_in_last` / `updated_in_last`, linked entities, customers, tags, owner, processed, plus operator conditions; resumable scans |
 | `pb_link_note_entity` | Link a note to a hierarchy entity |
 | `pb_delete_note_relationship` | Delete a note–entity relationship |
 
@@ -59,7 +61,7 @@ MCP server for the [Productboard Public API v2](https://developer.productboard.c
 | `pb_list_members` | List workspace members with email and role |
 | `pb_get_member` | Get a single member by ID |
 | `pb_search_members` | Search members by name or email |
-| `pb_get_member_activity` | Get recent activity for a member |
+| `pb_get_member_activity` | Member activity analytics for a date range (summary or per-day rows) |
 | `pb_list_teams` | List teams, optionally with members |
 | `pb_get_team` | Get a single team by ID |
 | `pb_search_teams` | Search teams by name |
@@ -77,6 +79,33 @@ MCP server for the [Productboard Public API v2](https://developer.productboard.c
 | `pb_create_field_value` | Create a value for a custom select field |
 | `pb_update_field_value` | Update an existing field value |
 | `pb_delete_field_value` | Delete a field value |
+
+## Known API issue: dependency direction
+
+The public API reports `isBlocking` / `isBlockedBy` **inverted** relative to the Productboard UI
+(verified 2026-10-12 in the UI and with the official Productboard MCP on two independent pairs —
+e.g. the API says *Playback* `isBlocking` *🎨 Accessibility-friendly video player components*, while the UI
+shows Playback as **blocked by** it).
+
+- **Reads are corrected**: `pb_get_entity`, `pb_list_entity_relationships` and `pb_get_note` report
+  dependencies in the UI direction, and the `type` filter of `pb_list_entity_relationships` is
+  translated before it is sent (`raw=true` on `pb_get_entity` still returns the API's own values).
+- **Writes need no correction**: `pb_create_entity_relationship` and `pb_delete_entity_relationship`
+  take `isBlocking` / `isBlockedBy` in the UI direction and send them unchanged. Verified 2026-10-12 with a
+  reversible write test: creating *A* `isBlocking` *B* showed in the UI (via the official MCP) as "A is
+  blocking B", the API then read it back as `isBlockedBy`, and `DELETE …/relationships/isBlocking/B` removed it.
+  So only the API's read direction is inverted.
+
+## Live test
+
+`test/live-read-tools.ts` runs every read tool through an in-memory MCP client against a real
+workspace and compares each result with direct Productboard API calls (including full scans for
+the search tools and cursor walks that check nothing is skipped or repeated). It never calls write
+tools; the only non-GET requests are read-only `POST …/search` calls.
+
+```bash
+PB_TOKEN=your_token npm run test:live      # add PB_EU=true for EU workspaces
+```
 
 ## Deploy to Cloud Run
 
@@ -215,4 +244,11 @@ ngrok http 3000
 - PB OAuth access tokens may not include a refresh token depending on your OAuth app configuration; if your token expires, revisit `/setup` to re-authorize.
 - `POST /v2/entities/fields/tags/values` returns HTTP 500 (PB bug) — tags can only be listed, not created via API.
 - `opportunityNote` cannot be created via the public API; `pb_create_note` always uses `textNote`.
-- The `objectives` type returns empty from `POST /v2/entities/search`; use `pb_list_entities` instead.
+- The `objectives` type returns empty from `POST /v2/entities/search`; `pb_search_entities` always fetches objectives with `GET /v2/entities`.
+- The public API only filters by exact values joined with AND (and `GET /v2/entities` ignores `archived=false` and rejects date filters). Operators, date ranges, `archived=false` and text search are evaluated by the server over fetched pages, so large scans may need several calls — follow `resume_cursor` until `complete` is true.
+- `POST /v2/notes/search` rejects most of its published filter shape and silently ignores unknown filter keys, so note search uses `GET /v2/notes` filters instead.
+- A `pageCursor` sent on its own drops all filters; every paginated request re-sends the original filters/body with the cursor.
+- Responses are capped at 25,000 characters. List items are dropped (never cut mid-JSON) and the returned cursor resumes at the first dropped item.
+- Relationship rows include the related entity's name (`target_name`), looked up with one `GET /v2/entities/{id}` per related entity (there is no bulk lookup), cached per call and capped at 100 per call (`names_truncated` says when the cap is hit).
+- Health is returned as current + previous status only; the public API has no health history.
+- Standalone Productboard documents are not exposed by the public API (`/v2/documents` → 404); `pb_read_entity_document` reads rich-text fields on entities instead.

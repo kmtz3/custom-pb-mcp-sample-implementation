@@ -1,9 +1,21 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { pbFetch, withRetry, fetchAllPages, fetchPage } from '../services/pbClient.js';
+import { pbFetch, withRetry, fetchAllPages } from '../services/pbClient.js';
 import { CHARACTER_LIMIT } from '../constants.js';
 import { paginationSchema, responseFormatSchema, ResponseFormat } from '../schemas/common.js';
 import type { PBMember, PBTeam, PBMemberActivityRecord } from '../types.js';
+import { type Json, errorResult, respondList, respondObject, encodeCursor, scan, postPager, getPager, fetchAll } from '../lib/shape.js';
+
+const memberRow = (m: PBMember) => ({
+  id: m.id, name: m.fields?.name, email: m.fields?.email ?? '[redacted]', role: m.fields?.role,
+  ...(m.fields?.disabled ? { disabled: true } : {}), ...(m.fields?.invitationPending ? { invitation_pending: true } : {}),
+});
+const memberRowMd = (r: Json) =>
+  `- **${r.name ?? r.id}** \`${r.id}\` — ${r.email} — ${r.role ?? 'N/A'}${r.disabled ? ' *(disabled)*' : r.invitation_pending ? ' *(invited)*' : ''}`;
+const teamRow = (t: PBTeam & { members?: PBMember[] }) => ({
+  id: t.id, name: t.fields?.name, handle: t.fields?.handle, description: t.fields?.description || undefined,
+  ...(t.members ? { members: t.members.map(memberRow) } : {}),
+});
 
 function handleError(err: unknown): string {
   if (err instanceof Error) {
@@ -62,30 +74,15 @@ lacks members:pii:read scope.`,
         if (query) params.push(`query=${encodeURIComponent(query)}`);
         if (roles?.length) roles.forEach((r) => params.push(`roles[]=${r}`));
         const path = `/v2/members?${params.join('&')}`;
-        const data = await fetchAllPages<PBMember>(path, 'list members');
-
-        const output = { data, count: data.length };
-
-        let text: string;
-        if (response_format === ResponseFormat.MARKDOWN) {
-          const lines = [`# Workspace Members (${data.length})`, ''];
-          for (const m of data) {
-            const f = m.fields ?? {};
-            const status = f.disabled ? ' (disabled)' : f.invitationPending ? ' (invited)' : '';
-            lines.push(`- **${f.name ?? m.id}** \`${m.id}\` — ${f.email ?? '[redacted]'} — ${f.role ?? 'N/A'}${status}`);
-          }
-          text = lines.join('\n');
-        } else {
-          text = JSON.stringify(output, null, 2);
-        }
-
-        if (text.length > CHARACTER_LIMIT) {
-          text = text.slice(0, CHARACTER_LIMIT) + '\n\n... [truncated]';
-        }
-
-        return { content: [{ type: 'text', text }], structuredContent: output as unknown as Record<string, unknown> };
+        const rows = (await fetchAllPages<PBMember>(path, 'list members')).map(memberRow);
+        return respondList({
+          format: response_format, rows, cursorAt: () => null,
+          truncatedNote: (shown, total) => `Showing ${shown} of ${total} members to fit the response size limit; use query or roles to narrow, or pb_search_members to page.`,
+          build: (shown, _n, note) => ({ data: shown, count: shown.length, total: rows.length, ...(note ? { truncated: note } : {}) }),
+          markdown: (o) => [`# Workspace Members (${o.count}${o.count < o.total ? ` of ${o.total}` : ''})`, '', ...o.data.map(memberRowMd), ...(o.truncated ? ['', `_${o.truncated}_`] : [])].join('\n'),
+        });
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );
@@ -138,34 +135,28 @@ Returns:
           );
         }
 
-        const output = { data, count: data.length };
-
-        let text: string;
-        if (response_format === ResponseFormat.MARKDOWN) {
-          const lines = [`# Teams (${data.length})`, ''];
-          for (const t of data) {
-            lines.push(`## ${t.fields?.name ?? t.id} \`${t.id}\``);
-            if (t.fields?.description) lines.push(`> ${t.fields.description}`);
-            if (t.members) {
-              lines.push('', `**Members (${t.members.length}):**`);
-              for (const m of t.members) {
-                lines.push(`- ${m.fields?.name ?? m.id} — ${m.fields?.email ?? '[redacted]'}`);
+        const rows = data.map(teamRow);
+        return respondList({
+          format: response_format, rows, cursorAt: () => null,
+          truncatedNote: (shown, total) => `Showing ${shown} of ${total} teams to fit the response size limit; use pb_get_team for one team's members.`,
+          build: (shown, _n, note) => ({ data: shown, count: shown.length, total: rows.length, ...(note ? { truncated: note } : {}) }),
+          markdown: (o) => {
+            const lines = [`# Teams (${o.count}${o.count < o.total ? ` of ${o.total}` : ''})`, ''];
+            for (const t of o.data) {
+              lines.push(`## ${t.name ?? t.id} \`${t.id}\`${t.handle ? ` @${t.handle}` : ''}`);
+              if (t.description) lines.push(`> ${t.description}`);
+              if (t.members) {
+                lines.push('', `**Members (${t.members.length}):**`);
+                for (const m of t.members) lines.push(`- ${m.name ?? m.id} — ${m.email}`);
               }
+              lines.push('');
             }
-            lines.push('');
-          }
-          text = lines.join('\n');
-        } else {
-          text = JSON.stringify(output, null, 2);
-        }
-
-        if (text.length > CHARACTER_LIMIT) {
-          text = text.slice(0, CHARACTER_LIMIT) + '\n\n... [truncated]';
-        }
-
-        return { content: [{ type: 'text', text }], structuredContent: output as unknown as Record<string, unknown> };
+            if (o.truncated) lines.push(`_${o.truncated}_`);
+            return lines.join('\n');
+          },
+        });
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );
@@ -188,7 +179,7 @@ Args:
   - search_query (string, optional): Full-text search on name or email (1–255 chars)
   - include_disabled (boolean): Also include disabled members alongside active ones (default true)
   - include_pending (boolean): Also include invitation-pending members (default false)
-  - limit (number): Max results per page, 1–200 (default 200)
+  - limit (number): Max results, 1–200 (default 50)
   - page_cursor (string, optional): Cursor from a previous response's next_cursor field
   - response_format ('markdown' | 'json'): Output format (default 'markdown')
 
@@ -235,40 +226,23 @@ Returns:
           },
         };
 
-        const url = page_cursor
-          ? `/v2/members/search?pageCursor=${encodeURIComponent(page_cursor)}`
-          : '/v2/members/search';
-
-        const raw = await withRetry(
-          () => pbFetch<{ data: PBMember[]; links?: { next?: string } }>(
-            page_cursor ? 'GET' : 'POST', url, page_cursor ? undefined : body
-          ),
-          'search members'
-        );
-
-        const data = (raw.data ?? []).slice(0, limit);
-        const nextMatch = raw.links?.next?.match(/pageCursor=([^&]+)/);
-        const nextCursor = nextMatch ? decodeURIComponent(nextMatch[1]) : null;
-        const output = { data, count: data.length, has_more: !!nextCursor, next_cursor: nextCursor ?? undefined };
-
-        let text: string;
-        if (response_format === ResponseFormat.MARKDOWN) {
-          const lines = [`# Members (${data.length}${nextCursor ? ', more available' : ''})`, ''];
-          for (const m of data) {
-            const f = m.fields ?? {};
-            const status = f.disabled ? ' *(disabled)*' : f.invitationPending ? ' *(invited)*' : '';
-            lines.push(`- **${f.name ?? m.id}** \`${m.id}\` — ${f.email ?? '[redacted]'} — ${f.role ?? 'N/A'}${status}`);
-          }
-          if (nextCursor) lines.push(`\n---\n_Next page cursor: \`${nextCursor}\`_`);
-          text = lines.join('\n');
-        } else {
-          text = JSON.stringify(output, null, 2);
-        }
-
-        if (text.length > CHARACTER_LIMIT) text = text.slice(0, CHARACTER_LIMIT) + '\n\n... [truncated]';
-        return { content: [{ type: 'text', text }], structuredContent: output as unknown as Record<string, unknown> };
+        // The search body is re-sent with every pageCursor (a cursor alone drops the filters).
+        const res = await scan({
+          sources: [postPager('/v2/members/search', body, 'search members')], start: page_cursor,
+          limit, maxPages: Math.ceil(limit / 100) + 1, map: (m: PBMember) => memberRow(m),
+        });
+        return respondList({
+          format: response_format, rows: res.rows.map((r) => r.row),
+          cursorAt: (k) => encodeCursor(k < res.rows.length ? res.rows[k].pos : res.resume),
+          build: (shown, next, note) => ({ data: shown, count: shown.length, has_more: !!next, next_cursor: next ?? undefined, ...(note ? { truncated: note } : {}) }),
+          markdown: (o) => [
+            `# Members (${o.count}${o.has_more ? ', more available' : ''})`, '', ...o.data.map(memberRowMd),
+            ...(o.truncated ? ['', `_${o.truncated}_`] : []),
+            ...(o.next_cursor ? ['', `_Next page cursor: \`${o.next_cursor}\`_`] : []),
+          ].join('\n'),
+        });
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );
@@ -340,7 +314,7 @@ Note: Requires analytics scope. The analytics endpoint may not be available on a
     async ({ date_from, date_to, mode, workspace_members_only, include_disabled, enrich_profiles, role_filter, active_filter, include_zero_activity, response_format }) => {
       try {
         if (date_from > date_to) {
-          return { content: [{ type: 'text', text: 'Error: date_from must not be after date_to' }] };
+          return errorResult('Error: date_from must not be after date_to');
         }
 
         const VIEW_KEYS = [
@@ -363,25 +337,16 @@ Note: Requires analytics scope. The analytics endpoint may not be available on a
         // For wide date ranges this can exceed 50+ pages; cap prevents timeouts.
         const MAX_ANALYTICS_RECORDS = 3000;
         const analyticsRecords: PBMemberActivityRecord[] = [];
-        let nextPath: string | null =
-          `/v2/analytics/member-activities?dateFrom=${date_from}&dateTo=${date_to}`;
         let truncated = false;
-
-        while (nextPath) {
-          const r = await withRetry(
-            () => pbFetch<{ data: PBMemberActivityRecord[]; links?: { next?: string } }>('GET', nextPath!),
-            'fetch member activities'
-          );
-          if (r.data?.length) analyticsRecords.push(...r.data);
-          if (analyticsRecords.length >= MAX_ANALYTICS_RECORDS) {
-            truncated = true;
-            break;
-          }
-          const cursorMatch = r.links?.next?.match(/pageCursor=([^&]+)/);
-          nextPath = cursorMatch
-            ? `/v2/analytics/member-activities?pageCursor=${decodeURIComponent(cursorMatch[1])}`
-            : null;
-        }
+        // dateFrom/dateTo are re-sent with every pageCursor (never rely on the cursor alone).
+        const activityPager = getPager('/v2/analytics/member-activities', { dateFrom: date_from, dateTo: date_to }, 'fetch member activities');
+        let activityCursor: string | undefined;
+        do {
+          const page = await activityPager(activityCursor);
+          analyticsRecords.push(...(page.data as PBMemberActivityRecord[]));
+          activityCursor = page.next ?? undefined;
+          if (activityCursor && analyticsRecords.length >= MAX_ANALYTICS_RECORDS) { truncated = true; break; }
+        } while (activityCursor);
 
         // ── Fetch member profiles (for enrichment and/or workspace filter) ──
         type MemberProfile = { name: string; email: string; role: string };
@@ -392,23 +357,9 @@ Note: Requires analytics scope. The analytics endpoint may not be available on a
         if (needsMembers) {
           let allMembers: PBMember[] = [];
           try {
+            // POST body re-sent with every pageCursor (GET /members/search?pageCursor is not a valid route).
             const body = { data: { filter: {}, return: { includeDisabled: !!include_disabled } } };
-            let r = await withRetry(
-              () => pbFetch<{ data: PBMember[]; links?: { next?: string } }>('POST', '/v2/members/search', body),
-              'fetch members for activity enrichment'
-            );
-            if (r.data?.length) allMembers.push(...r.data);
-            let cursorMatch = r.links?.next?.match(/pageCursor=([^&]+)/);
-            while (cursorMatch) {
-              r = await withRetry(
-                () => pbFetch<{ data: PBMember[]; links?: { next?: string } }>(
-                  'GET', `/v2/members/search?pageCursor=${decodeURIComponent(cursorMatch![1])}`
-                ),
-                'fetch members page'
-              );
-              if (r.data?.length) allMembers.push(...r.data);
-              cursorMatch = r.links?.next?.match(/pageCursor=([^&]+)/);
-            }
+            allMembers = await fetchAll(postPager('/v2/members/search', body, 'fetch members for activity enrichment'));
           } catch {
             // Non-fatal — proceed without enrichment/filtering
           }
@@ -527,15 +478,18 @@ Note: Requires analytics scope. The analytics endpoint may not be available on a
         const truncatedWarning = truncated
           ? `⚠️ Results capped at ${MAX_ANALYTICS_RECORDS} raw records (${rows.length} members shown). Use a shorter date range for complete data.`
           : undefined;
-        const output = { mode, date_from, date_to, data: rows, count: rows.length, truncated, ...(aggregateDuplicationWarning ? { warning: aggregateDuplicationWarning } : {}), ...(truncatedWarning ? { truncation_warning: truncatedWarning } : {}) };
-
-        // ── Format output ─────────────────────────────────────────────────
-        let text: string;
-        if (response_format === ResponseFormat.MARKDOWN) {
+        const allRows = rows;
+        return respondList({
+          format: response_format, rows: allRows, cursorAt: () => null,
+          truncatedNote: (shown, total) => `Showing ${shown} of ${total} rows to fit the response size limit; use a shorter date range, role_filter or active_filter, or mode='summary'.`,
+          build: (shown, _n, note) => ({ mode, date_from, date_to, data: shown, count: shown.length, total: allRows.length, truncated, ...(note ? { rows_truncated: note } : {}), ...(aggregateDuplicationWarning ? { warning: aggregateDuplicationWarning } : {}), ...(truncatedWarning ? { truncation_warning: truncatedWarning } : {}) }),
+          markdown: (o) => {
+          const rows = o.data as (SummaryRow | RawRow)[];
           const lines = [
-            `# Member Activity — ${date_from} to ${date_to} (${mode}, ${rows.length} rows)`, '',
+            `# Member Activity — ${date_from} to ${date_to} (${mode}, ${o.count}${o.count < o.total ? ` of ${o.total}` : ''} rows)`, '',
           ];
           if (truncatedWarning) lines.push(`> ${truncatedWarning}`, '');
+          if (o.rows_truncated) lines.push(`> ${o.rows_truncated}`, '');
           if (aggregateDuplicationWarning) lines.push(`> ${aggregateDuplicationWarning}`, '');
           if (mode === 'summary') {
             for (const r of rows as SummaryRow[]) {
@@ -553,15 +507,11 @@ Note: Requires analytics scope. The analytics endpoint may not be available on a
               lines.push(`| ${r.date} | ${r.name} | ${r.activeFlag ? 'yes' : 'no'} | ${r.totalViewEvents} | ${r.totalEditEvents} |`);
             }
           }
-          text = lines.join('\n');
-        } else {
-          text = JSON.stringify(output, null, 2);
-        }
-
-        if (text.length > CHARACTER_LIMIT) text = text.slice(0, CHARACTER_LIMIT) + '\n\n... [truncated]';
-        return { content: [{ type: 'text', text }], structuredContent: output as unknown as Record<string, unknown> };
+          return lines.join('\n');
+          },
+        });
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );
@@ -592,18 +542,13 @@ Returns:
           `get member ${id}`
         );
         const m = r.data;
-        const f = m.fields ?? {};
-        const output = m;
-        let text: string;
-        if (response_format === ResponseFormat.MARKDOWN) {
+        return respondObject(response_format, m, (o) => {
+          const f = o.fields ?? {};
           const status = f.disabled ? ' *(disabled)*' : f.invitationPending ? ' *(invited)*' : '';
-          text = `# Member: ${f.name ?? id}\n- **ID**: \`${m.id}\`\n- **Email**: ${f.email ?? '[redacted]'}\n- **Role**: ${f.role ?? 'N/A'}${status}`;
-        } else {
-          text = JSON.stringify(output, null, 2);
-        }
-        return { content: [{ type: 'text', text }], structuredContent: output as unknown as Record<string, unknown> };
+          return `# Member: ${f.name ?? id}\n- **ID**: \`${o.id}\`\n- **Email**: ${f.email ?? '[redacted]'}\n- **Role**: ${f.role ?? 'N/A'}${status}`;
+        });
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );
@@ -638,24 +583,17 @@ Returns:
             : Promise.resolve([] as PBMember[]),
         ]);
         const team = teamRes.data;
-        const output = { ...team, ...(include_members ? { members } : {}) };
-        let text: string;
-        if (response_format === ResponseFormat.MARKDOWN) {
-          const lines = [
-            `# Team: ${team.fields?.name ?? id} \`${team.id}\``,
-            team.fields?.description ? `> ${team.fields.description}` : '',
-          ].filter(Boolean);
-          if (include_members) {
-            lines.push('', `**Members (${members.length}):**`);
-            for (const m of members) lines.push(`- ${m.fields?.name ?? m.id} — ${m.fields?.email ?? '[redacted]'}`);
+        const output = teamRow({ ...team, ...(include_members ? { members } : {}) });
+        return respondObject(response_format, output, (o) => {
+          const lines = [`# Team: ${o.name ?? id} \`${o.id}\`${o.handle ? ` @${o.handle}` : ''}`, o.description ? `> ${o.description}` : ''].filter(Boolean);
+          if (o.members) {
+            lines.push('', `**Members (${o.members.length}):**`);
+            for (const m of o.members) lines.push(`- ${m.name ?? m.id} — ${m.email}${m.role ? ` — ${m.role}` : ''}`);
           }
-          text = lines.join('\n');
-        } else {
-          text = JSON.stringify(output, null, 2);
-        }
-        return { content: [{ type: 'text', text }], structuredContent: output as unknown as Record<string, unknown> };
+          return lines.join('\n');
+        });
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );
@@ -695,25 +633,18 @@ Returns:
         if (Object.keys(filter).length) (body['data'] as Record<string, unknown>)['filter'] = filter;
         if (effectiveQuery) (body['data'] as Record<string, unknown>)['search'] = { query: effectiveQuery };
 
-        const r = await withRetry(
-          () => pbFetch<{ data: PBTeam[] }>('POST', '/v2/teams/search', body),
-          'search teams'
-        );
-        const data = r.data ?? [];
-        const output = { data, count: data.length };
-        let text: string;
-        if (response_format === ResponseFormat.MARKDOWN) {
-          const lines = [`# Teams Search (${data.length} results)`, ''];
-          for (const t of data) {
-            lines.push(`- **${t.fields?.name ?? t.id}** \`${t.id}\`${t.fields?.description ? ` — ${t.fields.description}` : ''}`);
-          }
-          text = lines.join('\n');
-        } else {
-          text = JSON.stringify(output, null, 2);
-        }
-        return { content: [{ type: 'text', text }], structuredContent: output as unknown as Record<string, unknown> };
+        // All pages, re-sending the search body with each pageCursor.
+        const rows = ((await fetchAll(postPager('/v2/teams/search', body, 'search teams'))) as PBTeam[]).map(teamRow);
+        return respondList({
+          format: response_format, rows, cursorAt: () => null,
+          truncatedNote: (shown, total) => `Showing ${shown} of ${total} teams to fit the response size limit; narrow the search.`,
+          build: (shown, _n, note) => ({ data: shown, count: shown.length, total: rows.length, ...(note ? { truncated: note } : {}) }),
+          markdown: (o) => [`# Teams Search (${o.count} results)`, '',
+            ...o.data.map((t: Json) => `- **${t.name ?? t.id}** \`${t.id}\`${t.handle ? ` @${t.handle}` : ''}${t.description ? ` — ${t.description}` : ''}`),
+            ...(o.truncated ? ['', `_${o.truncated}_`] : [])].join('\n'),
+        });
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );
@@ -752,7 +683,7 @@ Returns:
         const team = r.data;
         return { content: [{ type: 'text', text: `Created team \`${team.id}\`: **${team.fields?.name ?? name}**` }], structuredContent: team as unknown as Record<string, unknown> };
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );
@@ -784,7 +715,7 @@ Returns:
     async ({ id, name, handle, description }) => {
       try {
         if ([name, handle, description].every((v) => v === undefined)) {
-          return { content: [{ type: 'text', text: 'Error: Provide at least one field to update' }] };
+          return errorResult('Error: Provide at least one field to update');
         }
 
         const fields: Record<string, unknown> = {};
@@ -797,7 +728,7 @@ Returns:
         );
         return { content: [{ type: 'text', text: `Updated team \`${id}\` successfully.` }] };
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );
@@ -827,7 +758,7 @@ Returns:
         await withRetry(() => pbFetch<unknown>('DELETE', `/v2/teams/${id}`), `delete team ${id}`);
         return { content: [{ type: 'text', text: `Deleted team \`${id}\`.` }] };
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );
@@ -861,7 +792,7 @@ Returns:
         );
         return { content: [{ type: 'text', text: `Added member \`${member_id}\` to team \`${team_id}\`.` }] };
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );
@@ -897,7 +828,7 @@ Returns:
         );
         return { content: [{ type: 'text', text: `Removed member \`${member_id}\` from team \`${team_id}\`.` }] };
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );

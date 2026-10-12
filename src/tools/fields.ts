@@ -4,6 +4,7 @@ import { pbFetch, withRetry, fetchAllPages } from '../services/pbClient.js';
 import { CHARACTER_LIMIT } from '../constants.js';
 import { responseFormatSchema, ResponseFormat } from '../schemas/common.js';
 import type { PBFieldValueDefinition } from '../types.js';
+import { errorResult, respondList } from '../lib/shape.js';
 
 function handleError(err: unknown): string {
   if (err instanceof Error) {
@@ -59,33 +60,21 @@ live-tested 2026-05-03) — tags can only be listed, not created via API.`,
     async ({ field_id, response_format }) => {
       try {
         const data = await fetchAllPages<PBFieldValueDefinition>(
-          `/v2/entities/fields/${field_id}/values`,
+          `/v2/entities/fields/${encodeURIComponent(field_id)}/values`,
           `list field values ${field_id}`
         );
 
-        const output = {
-          data: data.map((v) => ({ id: v.id, name: v.fields.name, color: v.fields.color ?? null })),
-          count: data.length,
-        };
-
-        let text: string;
-        if (response_format === ResponseFormat.MARKDOWN) {
-          const lines = [`# Field Values: \`${field_id}\` (${data.length})`, ''];
-          for (const v of data) {
-            lines.push(`- **${v.fields.name}** \`${v.id}\`${v.fields.color ? ` — ${v.fields.color}` : ''}`);
-          }
-          text = lines.join('\n');
-        } else {
-          text = JSON.stringify(output, null, 2);
-        }
-
-        if (text.length > CHARACTER_LIMIT) {
-          text = text.slice(0, CHARACTER_LIMIT) + '\n\n... [truncated]';
-        }
-
-        return { content: [{ type: 'text', text }], structuredContent: output as unknown as Record<string, unknown> };
+        const rows = data.map((v) => ({ id: v.id, name: v.fields.name, color: v.fields.color ?? null }));
+        return respondList({
+          format: response_format, rows, cursorAt: () => null,
+          truncatedNote: (shown, total) => `Showing ${shown} of ${total} values to fit the response size limit; use response_format='json' for a more compact list.`,
+          build: (shown, _n, note) => ({ data: shown, count: shown.length, total: rows.length, ...(note ? { truncated: note } : {}) }),
+          markdown: (o) => [`# Field Values: \`${field_id}\` (${o.count}${o.count < o.total ? ` of ${o.total}` : ''})`, '',
+            ...o.data.map((v: { id: string; name: string; color: string | null }) => `- **${v.name}** \`${v.id}\`${v.color ? ` — ${v.color}` : ''}`),
+            ...(o.truncated ? ['', `_${o.truncated}_`] : [])].join('\n'),
+        });
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );
@@ -137,7 +126,7 @@ Returns:
         const text = `Created field value **${val.fields?.name ?? name}** \`${val.id}\` on field \`${field_id}\`.`;
         return { content: [{ type: 'text', text }], structuredContent: val as unknown as Record<string, unknown> };
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );
@@ -171,7 +160,7 @@ Returns:
     async ({ field_id, value_id, name, color }) => {
       try {
         if (name === undefined && color === undefined) {
-          return { content: [{ type: 'text', text: 'Error: Provide at least one of name or color to update' }] };
+          return errorResult('Error: Provide at least one of name or color to update');
         }
 
         const fields: Record<string, unknown> = {};
@@ -183,7 +172,7 @@ Returns:
         );
         return { content: [{ type: 'text', text: `Updated field value \`${value_id}\` on field \`${field_id}\`.` }] };
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );
@@ -223,7 +212,7 @@ Returns:
     async ({ field_id, value_id, force, replace_with_id }) => {
       try {
         if (force && replace_with_id) {
-          return { content: [{ type: 'text', text: 'Error: Cannot provide both force and replace_with_id' }] };
+          return errorResult('Error: Cannot provide both force and replace_with_id');
         }
 
         // Live API: DELETE body is rejected (400). force and replaceWith are query params.
@@ -237,7 +226,7 @@ Returns:
         );
         return { content: [{ type: 'text', text: `Deleted field value \`${value_id}\` from field \`${field_id}\`.` }] };
       } catch (err) {
-        return { content: [{ type: 'text', text: handleError(err) }] };
+        return errorResult(handleError(err));
       }
     }
   );
