@@ -440,8 +440,9 @@ Returns:
 A note can be linked to one customer — either a Company (entity) or a User. This replaces
 any existing customer relationship.
 
-Uses POST /v2/notes/{id}/relationships (PBToolkit-verified pattern). If a customer
-relationship already exists it is automatically replaced by the API.
+Uses PUT /v2/notes/{id}/relationships/customer (PBToolkit-verified pattern), which works
+whether or not the note already has a customer. (POST /v2/notes/{id}/relationships rejects
+the call with 422 when a customer is already set.)
 
 Propagation delay: if the target company or user entity was just created (within the
 last ~30 seconds), this call may return a 404. Wait a few seconds and retry — the
@@ -469,8 +470,8 @@ Returns:
     async ({ note_id, customer_type, customer_id }) => {
       try {
         await withRetry(
-          () => pbFetch<unknown>('POST', `/v2/notes/${note_id}/relationships`, {
-            data: { type: 'customer', target: { type: customer_type, id: customer_id } },
+          () => pbFetch<unknown>('PUT', `/v2/notes/${note_id}/relationships/customer`, {
+            data: { target: { type: customer_type, id: customer_id } },
           }),
           `set note customer ${note_id}`
         );
